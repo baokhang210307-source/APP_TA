@@ -12,8 +12,10 @@ const THEME_KEY = "baoKhangVocabTheme.v1";
 
 // Google Apps Script Web App endpoint for per-user JSON sync.
 // Token/secret must stay inside Apps Script, not in public GitHub files.
-const CLOUD_SYNC_URL = "https://script.google.com/macros/s/AKfycbyLQgbizj2nM6WvXHVQlFVS6arUTzDGD5WgwC3XYFDGJ73WDYsNYfFNovkIisOKQWHz/exec";
+const CLOUD_SYNC_URL = "https://script.google.com/macros/s/AKfycbz9xxUk6vWa2tFEVcvRDscp3Ml36Va9CyThsZ9-2WV6pe9sWdRM9Zw2xeO9I5nsqTwK/exec";
 const CLOUD_FOLDER_ID = "1-Y1_DzW6zVNQFvTzhmFEUXoolb-efxeu";
+const CLOUD_SYNC_TOKEN = "60QcQXXdkwxhLMiTXRaLX/ZnAsnDSRumRRwoY6kCbXw=";
+const CLOUD_STATE_FILE = "baokhang-vocab-users.json";
 
 const DEFAULT_SETTINGS = {
   newWordsPerSession: 10,
@@ -124,57 +126,94 @@ function queueCloudSync() {
 async function syncCurrentWorkspaceToCloud() {
   if (!hasCloudSync() || isCloudSyncing || !session) return;
 
-  const payload = session.type === "user"
-    ? buildUserCloudPayload()
-    : buildAdminCloudPayload();
-
-  if (!payload) return;
-
   isCloudSyncing = true;
   try {
-    await cloudRequest(payload);
-    showToast("Đã đồng bộ JSON lên Drive.", 1600);
+    if (session.type === "user") {
+      await saveUserToCloud(currentUser());
+    } else {
+      await saveAllUsersToCloud();
+    }
   } catch (error) {
     console.warn("Cloud sync failed", error);
-    showToast("Chưa đồng bộ được Drive. Dữ liệu vẫn đã lưu trong trình duyệt.", 2600);
   } finally {
     isCloudSyncing = false;
   }
 }
 
-function buildUserCloudPayload() {
-  const user = currentUser();
+async function saveUserToCloud(user) {
   if (!user) return null;
 
-  return {
-    action: "saveUserWorkspace",
-    filename: `${user.username}.json`,
+  return cloudSave(cloudUserFileName(user.username), {
+    type: "userWorkspace",
     username: user.username,
-    user
-  };
+    user,
+    updatedAt: Date.now()
+  });
 }
 
-function buildAdminCloudPayload() {
-  return {
-    action: "saveAllUsers",
-    filename: "baokhang-vocab-users.json",
+async function saveAllUsersToCloud() {
+  await cloudSave(CLOUD_STATE_FILE, {
+    type: "appState",
     admin: ADMIN.username,
-    state
-  };
+    state,
+    updatedAt: Date.now()
+  });
+
+  for (const user of Object.values(state.users || {})) {
+    await saveUserToCloud(user);
+  }
+}
+
+function cloudUserFileName(username) {
+  const safeName = String(username || "user")
+    .trim()
+    .replace(/[\\/:*?"<>|#%{}~&]/g, "_");
+  return `${safeName || "user"}.json`;
+}
+
+async function cloudLoad(filename) {
+  return cloudRequest({
+    action: "load",
+    filename
+  });
+}
+
+async function cloudSave(filename, data) {
+  const content = JSON.stringify(data, null, 2);
+  return cloudRequest({
+    action: "save",
+    filename,
+    mimeType: "application/json",
+    contentType: "application/json",
+    content,
+    data,
+    payload: data
+  });
 }
 
 async function cloudRequest(payload) {
   const response = await fetch(CLOUD_SYNC_URL.trim(), {
     method: "POST",
+    headers: {
+      "Content-Type": "text/plain;charset=utf-8"
+    },
     body: JSON.stringify({
       app: "BaoKhangVocab",
       folderId: CLOUD_FOLDER_ID,
+      token: CLOUD_SYNC_TOKEN,
       sentAt: Date.now(),
       ...payload
     })
   });
 
-  const data = await response.json().catch(() => ({}));
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error("Google Apps Script did not return JSON. Check Web App deployment URL and access.");
+  }
+
   if (!response.ok || data.success === false) {
     throw new Error(data.error || "Cloud sync error");
   }
@@ -182,34 +221,61 @@ async function cloudRequest(payload) {
   return data;
 }
 
+function readCloudPayload(data) {
+  const raw = data?.data ?? data?.content ?? data?.payload ?? null;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  return raw && typeof raw === "object" ? raw : null;
+}
+
 async function hydrateFromCloudLogin({ role, username, password }) {
   if (!hasCloudSync()) return false;
 
   try {
-    const data = await cloudRequest({
-      action: "login",
-      role,
-      username,
-      password
-    });
+    const files = role === "admin"
+      ? [CLOUD_STATE_FILE]
+      : [cloudUserFileName(username), CLOUD_STATE_FILE];
 
-    if (data.state?.users) {
-      state = data.state;
-      state.users = state.users || {};
-      Object.values(state.users).forEach(ensureUserShape);
-      persistStateOnly();
-      return true;
-    }
+    for (const filename of files) {
+      const data = await cloudLoad(filename);
+      if (data.success === false || data.exists === false) continue;
 
-    if (data.user) {
-      state.users[username] = {
-        ...data.user,
-        username,
-        password: data.user.password || password
-      };
-      ensureUserShape(state.users[username]);
-      persistStateOnly();
-      return true;
+      const payload = readCloudPayload(data);
+      if (!payload) continue;
+
+      const cloudState = payload.state || (payload.users ? { users: payload.users } : null);
+      if (role === "admin" && cloudState?.users) {
+        state = {
+          ...state,
+          ...cloudState,
+          users: cloudState.users || {}
+        };
+        Object.values(state.users).forEach(ensureUserShape);
+        persistStateOnly();
+        return true;
+      }
+
+      const cloudUser = payload.user
+        || payload.users?.[username]
+        || payload.state?.users?.[username]
+        || (payload.username === username ? payload : null);
+
+      if (role === "user" && cloudUser) {
+        state.users[username] = {
+          ...cloudUser,
+          username,
+          password: cloudUser.password || password
+        };
+        ensureUserShape(state.users[username]);
+        persistStateOnly();
+        return true;
+      }
     }
 
     return false;
@@ -340,14 +406,14 @@ function renderLogin() {
           </div>
         </div>
 
-        <form id="loginForm" class="form-grid">
+        <form id="loginForm" class="form-grid" autocomplete="off" data-form-type="other">
           <div class="field full">
             <label for="username">Tên đăng nhập</label>
-            <input id="username" name="username" autocomplete="username" placeholder="${isAdmin ? "Tên đăng nhập Admin" : "Tên đăng nhập User"}" required />
+            <input id="username" name="bk_user_${isAdmin ? "admin" : "user"}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" placeholder="${isAdmin ? "Tên đăng nhập Admin" : "Tên đăng nhập User"}" required />
           </div>
           <div class="field full">
-            <label for="password">Mật khẩu</label>
-            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Mật khẩu" required />
+            <label for="loginSecret">Mật khẩu</label>
+            <input id="loginSecret" class="masked-input" name="bk_secret_${Date.now()}" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Mật khẩu" required />
           </div>
           <div class="form-actions">
             <button class="btn ghost" type="button" data-action="back">Cancel</button>
@@ -1021,7 +1087,7 @@ async function handleLogin(event) {
   event.preventDefault();
   const role = route.role || "user";
   const username = document.getElementById("username").value.trim();
-  const password = document.getElementById("password").value;
+  const password = document.getElementById("loginSecret").value;
 
   if (role === "admin") {
     if (username === ADMIN.username && password === ADMIN.password) {

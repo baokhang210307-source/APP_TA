@@ -617,6 +617,11 @@ a {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent);
 }
 
+.masked-input {
+  -webkit-text-security: disc;
+  text-security: disc;
+}
+
 .form-actions {
   display: flex;
   flex-wrap: wrap;
