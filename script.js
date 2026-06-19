@@ -345,12 +345,21 @@ function render() {
   app.innerHTML = html + renderModal();
   bindCurrentView();
   createIcons();
+  animateProgressBars();
 }
 
 function createIcons() {
   if (window.lucide) {
     window.lucide.createIcons();
   }
+}
+
+function animateProgressBars() {
+  requestAnimationFrame(() => {
+    document.querySelectorAll("[data-progress-target]").forEach(element => {
+      element.style.width = `${Number(element.dataset.progressTarget) || 0}%`;
+    });
+  });
 }
 
 function renderLanding() {
@@ -515,6 +524,7 @@ function renderHome() {
   const newCount = getSelectableWords(user, { kind: "new" }).length;
   const settings = user.settings;
   const reviewSummary = getReviewSummary(user);
+  const sortedFolders = sortFoldersForDisplay(user);
 
   return `
     <section class="screen">
@@ -564,15 +574,7 @@ function renderHome() {
         </div>
       </section>
 
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h2>Đồng hồ ôn tập</h2>
-            <p>Hiển thị mốc ôn tập gần nhất.</p>
-          </div>
-        </div>
-        ${reviewSummary ? renderReviewSummary(reviewSummary) : emptyState("timer", "Chưa có lịch ôn tập", "Sau khi học từ mới, app sẽ tự tạo đồng hồ đếm ngược cho lần ôn tiếp theo.")}
-      </section>
+      ${renderReviewClockPanel(reviewSummary, "Đồng hồ ôn tập", "Hiển thị mốc ôn tập gần nhất.")}
 
       <section class="panel">
         <div class="panel-header">
@@ -603,7 +605,7 @@ function renderHome() {
         </div>
 
         <div class="item-grid" style="margin-top: 16px;">
-          ${user.folders.length ? user.folders.map(folder => renderFolderCard(user, folder)).join("") : emptyState("folder", "Chưa có folder", "Tạo folder đầu tiên, sau đó tạo file và thêm từ vựng vào file.")}
+          ${sortedFolders.length ? sortedFolders.map(folder => renderFolderCard(user, folder)).join("") : emptyState("folder", "Chưa có folder", "Tạo folder đầu tiên, sau đó tạo file và thêm từ vựng vào file.")}
         </div>
       </section>
     </section>
@@ -622,6 +624,8 @@ function renderFolder() {
   const folderWords = getAllWords(user, { folderId: folder.id });
   const newCount = folderWords.filter(item => item.word.level === 0).length;
   const dueCount = folderWords.filter(item => item.word.level > 0 && item.word.nextReviewAt && item.word.nextReviewAt <= Date.now()).length;
+  const reviewSummary = getReviewSummary(user, { folderId: folder.id });
+  const sortedFiles = sortFilesForDisplay(user, folder);
 
   return `
     <section class="screen">
@@ -650,6 +654,8 @@ function renderFolder() {
         </div>
       </section>
 
+      ${renderReviewClockPanel(reviewSummary, "Đồng hồ ôn tập trong folder", "Hiển thị mốc ôn tập gần nhất trong folder này.")}
+
       <section class="panel">
         <div class="panel-header">
           <div>
@@ -670,7 +676,7 @@ function renderFolder() {
         </form>
 
         <div class="item-grid" style="margin-top: 16px;">
-          ${folder.files.length ? folder.files.map(file => renderFileCard(user, folder, file)).join("") : emptyState("file", "Folder chưa có file", "Tạo file từ vựng để bắt đầu thêm từ và học.")}
+          ${sortedFiles.length ? sortedFiles.map(file => renderFileCard(user, folder, file)).join("") : emptyState("file", "Folder chưa có file", "Tạo file từ vựng để bắt đầu thêm từ và học.")}
         </div>
       </section>
     </section>
@@ -692,7 +698,7 @@ function renderFile() {
   const learned = words.filter(word => word.level > 0).length;
   const newCount = words.filter(word => word.level === 0).length;
   const dueCount = words.filter(word => word.level > 0 && word.nextReviewAt && word.nextReviewAt <= Date.now()).length;
-
+  const reviewSummary = getReviewSummary(user, { folderId: folder.id, fileId: file.id });
   return `
     <section class="screen">
       ${topbar({
@@ -707,6 +713,12 @@ function renderFile() {
       })}
 
       <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Học trong file</h2>
+            <p>Chỉ chọn từ vựng nằm trong file này.</p>
+          </div>
+        </div>
         <div class="grid-3">
           ${actionCard("Học từ mới", `${newCount} từ chưa học`, "play", "start-new-file", newCount === 0)}
           ${actionCard("Ôn tập đến hạn", `${dueCount} từ cần ôn`, "rotate-ccw", "start-review-file", dueCount === 0)}
@@ -714,7 +726,9 @@ function renderFile() {
         </div>
       </section>
 
-      <section class="panel">
+      ${renderReviewClockPanel(reviewSummary, "Đồng hồ ôn tập trong file", "Chỉ hiển thị mốc ôn tập của từ vựng đã học trong file này.")}
+
+      <section class="panel word-entry-panel">
         <div class="panel-header">
           <div>
             <h2>Thêm từ vựng</h2>
@@ -722,7 +736,7 @@ function renderFile() {
           </div>
         </div>
         <form id="addWordForm" class="form-grid">
-          <div class="entry-tabs field full" role="tablist" aria-label="Chọn cách nhập từ vựng">
+          <div class="entry-tabs field full" role="tablist" aria-label="Chọn cách nhập từ vựng" data-active="${wordEntryMode}">
             <button class="${wordEntryMode === "manual" ? "active" : ""}" type="button" data-action="set-word-entry-mode" data-mode="manual">
               <i data-lucide="keyboard"></i>Nhập từng từ
             </button>
@@ -730,25 +744,9 @@ function renderFile() {
               <i data-lucide="list-plus"></i>Nhập nhanh nhiều dòng
             </button>
           </div>
-          ${wordEntryMode === "manual" ? `
-            <div class="field">
-              <label for="wordTerm">Từ tiếng Anh</label>
-              <input id="wordTerm" required placeholder="Ví dụ: happy" />
-            </div>
-            <div class="field">
-              <label for="wordMeaning">Định nghĩa tiếng Việt</label>
-              <input id="wordMeaning" required placeholder="Ví dụ: vui vẻ" />
-            </div>
-            <div class="field full">
-              <label for="wordExample">Ví dụ hoặc ghi chú</label>
-              <textarea id="wordExample" placeholder="Tùy chọn"></textarea>
-            </div>
-          ` : `
-            <div class="field full">
-              <label for="bulkWords">Nhập mỗi dòng theo định dạng english - nghĩa tiếng Việt</label>
-              <textarea id="bulkWords" required placeholder="happy - Vui vẻ&#10;hello - xin chào"></textarea>
-            </div>
-          `}
+          <div class="word-entry-content ${wordEntryMode} field full">
+            ${renderWordEntryFields(wordEntryMode)}
+          </div>
           <div class="form-actions">
             <button class="btn ghost" type="button" data-action="back">Cancel</button>
             <button class="btn primary" type="submit"><i data-lucide="plus"></i>Thêm từ</button>
@@ -756,7 +754,7 @@ function renderFile() {
         </form>
       </section>
 
-      <section class="panel">
+      <section class="panel word-list-panel">
         <div class="panel-header">
           <div>
             <h2>Danh sách từ</h2>
@@ -770,6 +768,28 @@ function renderFile() {
         ` : emptyState("book-open", "File chưa có từ", "Thêm từ vựng đầu tiên để bắt đầu học.")}
       </section>
     </section>
+  `;
+}
+
+function renderWordEntryFields(mode) {
+  return mode === "manual" ? `
+    <div class="field">
+      <label for="wordTerm">Từ tiếng Anh</label>
+      <input id="wordTerm" required placeholder="Ví dụ: happy" />
+    </div>
+    <div class="field">
+      <label for="wordMeaning">Định nghĩa tiếng Việt</label>
+      <input id="wordMeaning" required placeholder="Ví dụ: vui vẻ" />
+    </div>
+    <div class="field full">
+      <label for="wordExample">Ví dụ hoặc ghi chú</label>
+      <textarea id="wordExample" placeholder="Tùy chọn"></textarea>
+    </div>
+  ` : `
+    <div class="field full">
+      <label for="bulkWords">Nhập mỗi dòng theo định dạng english: nghĩa tiếng Việt</label>
+      <textarea id="bulkWords" required placeholder="happy: Vui vẻ&#10;hello xin chào"></textarea>
+    </div>
   `;
 }
 
@@ -834,6 +854,9 @@ function renderStudy() {
   const feedback = activeStudy.feedback;
   const completedCount = activeStudy.index + (feedback?.correct ? 1 : 0);
   const progress = Math.round((completedCount / activeStudy.tasks.length) * 100);
+  const previousProgress = activeStudy.renderedProgress ?? progress;
+  activeStudy.renderedProgress = progress;
+  const progressLabel = `${completedCount}/${activeStudy.tasks.length} lượt đã đúng`;
 
   return `
     <section class="screen session-screen">
@@ -845,12 +868,17 @@ function renderStudy() {
         `
       })}
 
-      <div class="tracker">
+      <div class="tracker progress-tracker">
         <div class="tracker-top">
-          <span>Tracker</span>
-          <span>${completedCount}/${activeStudy.tasks.length}</span>
+          <span>Tiến độ</span>
+          <strong>${progressLabel}</strong>
         </div>
-        <div class="tracker-bar"><span style="width: ${progress}%"></span></div>
+        <div class="tracker-bar" aria-label="${escapeAttr(progressLabel)}">
+          <span
+            style="width: ${previousProgress}%"
+            data-progress-target="${progress}"
+          ></span>
+        </div>
       </div>
 
       <section class="study-card">
@@ -872,20 +900,22 @@ function renderStudy() {
 }
 
 function renderTypeTask(task, feedback) {
-  const isLocked = feedback?.correct;
   return `
-    <form id="typeAnswerForm" class="form-grid">
-      <div class="field full">
-        <label for="typedAnswer">Từ tiếng Anh</label>
-        <input id="typedAnswer" autocomplete="off" placeholder="${feedback?.retry ? "Gõ lại đúng đáp án để tiếp tục" : "Gõ đáp án"}" ${isLocked ? "disabled" : ""} required />
-      </div>
-      <div class="field full">
-        <div class="feedback ${feedback?.correct ? "good" : feedback ? "bad" : ""}">
-          ${feedback ? feedback.message : "Nhập từ tiếng Anh đúng với định nghĩa ở trên."}
+    <form id="typeAnswerForm" class="form-grid type-answer-form ${feedback ? "answered" : ""}">
+      ${feedback ? `
+        <div class="field full">
+          <div class="feedback prominent ${feedback.correct ? "good" : "bad"}">
+            ${feedback.message}
+          </div>
         </div>
-      </div>
+      ` : `
+        <div class="field full">
+          <label for="typedAnswer">Từ tiếng Anh</label>
+          <input id="typedAnswer" autocomplete="off" placeholder="Gõ đáp án" required />
+        </div>
+      `}
       <div class="form-actions">
-        ${isLocked ? "" : `
+        ${feedback ? "" : `
           <button class="btn primary" type="submit"><i data-lucide="check"></i>Kiểm tra</button>
         `}
       </div>
@@ -903,9 +933,11 @@ function renderChoiceTask(task, feedback) {
         return `<button class="choice-btn ${className}" data-action="choose-answer" data-choice="${escapeAttr(choice)}" ${feedback ? "disabled" : ""}>${escapeHtml(choice)}</button>`;
       }).join("")}
     </div>
-    <div class="feedback ${feedback?.correct ? "good" : feedback ? "bad" : ""}">
-      ${feedback ? feedback.message : "Chọn từ tiếng Anh khớp với định nghĩa."}
-    </div>
+    ${feedback ? `
+      <div class="feedback prominent choice-feedback ${feedback.correct ? "good" : "bad"}">
+        ${feedback.message}
+      </div>
+    ` : ""}
   `;
 }
 
@@ -998,6 +1030,115 @@ function renderModal() {
     `;
   }
 
+  if (modal.type === "confirm") {
+    return `
+      <div class="modal" role="dialog" aria-modal="true">
+        <section class="modal-card compact">
+          <div class="modal-hero-icon ${modal.variant === "danger" ? "danger" : ""}">
+            <i data-lucide="${modal.icon || "circle-help"}"></i>
+          </div>
+          <div class="modal-copy centered">
+            <h2>${escapeHtml(modal.title)}</h2>
+            <p>${escapeHtml(modal.message)}</p>
+          </div>
+          <div class="form-actions centered-actions">
+            <button class="btn ghost" type="button" data-action="close-modal">${escapeHtml(modal.cancelText || "Cancel")}</button>
+            <button class="btn ${modal.variant === "danger" ? "danger" : "primary"}" type="button" data-action="modal-confirm">
+              ${escapeHtml(modal.confirmText || "OK")}
+            </button>
+          </div>
+        </section>
+      </div>
+    `;
+  }
+
+  if (modal.type === "password-prompt") {
+    return `
+      <div class="modal" role="dialog" aria-modal="true">
+        <section class="modal-card compact">
+          <div class="panel-header">
+            <div>
+              <h2>Đổi mật khẩu</h2>
+              <p>Tạo mật khẩu mới cho user ${escapeHtml(modal.username)}.</p>
+            </div>
+            <button class="icon-btn" data-action="close-modal" aria-label="Close"><i data-lucide="x"></i></button>
+          </div>
+          <form id="passwordPromptForm" class="form-grid">
+            <div class="field full">
+              <label for="passwordPromptInput">Mật khẩu mới</label>
+              <input id="passwordPromptInput" type="text" autocomplete="off" required />
+            </div>
+            <div class="form-actions">
+              <button class="btn ghost" type="button" data-action="close-modal">Cancel</button>
+              <button class="btn primary" type="submit"><i data-lucide="key-round"></i>Lưu mật khẩu</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    `;
+  }
+
+  if (modal.type === "review-level-decision") {
+    return `
+      <div class="modal" role="dialog" aria-modal="true">
+        <section class="modal-card compact">
+          <div class="modal-hero-icon warning">
+            <i data-lucide="rotate-ccw"></i>
+          </div>
+          <div class="modal-copy centered">
+            <h2>Ôn sai nhiều lần</h2>
+            <p>Từ "${escapeHtml(modal.term)}" đã sai quá 3 lần trong phiên ôn này. Bạn muốn lùi từ này về một level hay giữ nguyên level hiện tại?</p>
+          </div>
+          <div class="form-actions centered-actions">
+            <button class="btn ghost" type="button" data-action="review-keep-level">Giữ nguyên</button>
+            <button class="btn primary" type="button" data-action="review-lower-level">Lùi 1 level</button>
+          </div>
+        </section>
+      </div>
+    `;
+  }
+
+  if (modal.type === "import-file-target") {
+    const user = currentUser();
+    const folders = user?.folders || [];
+    return `
+      <div class="modal" role="dialog" aria-modal="true">
+        <section class="modal-card compact import-folder-modal">
+          <div class="modal-hero-icon">
+            <i data-lucide="folder-input"></i>
+          </div>
+          <div class="modal-copy centered">
+            <h2>Chọn folder lưu file</h2>
+            <p>File "${escapeHtml(modal.fileName)}" sẽ được thêm vào folder bạn chọn trong workspace hiện tại.</p>
+          </div>
+          ${folders.length ? `
+            <div class="import-folder-list" role="list" aria-label="Folder hiện có">
+              ${folders.map(folder => `
+                <article class="import-folder-row" role="listitem">
+                  <div>
+                    <strong>${escapeHtml(folder.name)}</strong>
+                    <span>${folder.files.length} file</span>
+                  </div>
+                  <button class="btn primary compact-btn" type="button" data-action="import-file-to-folder" data-folder-id="${escapeAttr(folder.id)}">
+                    <i data-lucide="folder-down"></i>Import
+                  </button>
+                </article>
+              `).join("")}
+            </div>
+            <div class="form-actions centered-actions">
+              <button class="btn ghost" type="button" data-action="close-modal">Cancel</button>
+            </div>
+          ` : `
+            <p class="modal-note">Workspace này chưa có folder. Hãy tạo folder trước rồi nhận lại link file.</p>
+            <div class="form-actions centered-actions">
+              <button class="btn primary" type="button" data-action="close-modal">OK</button>
+            </div>
+          `}
+        </section>
+      </div>
+    `;
+  }
+
   return "";
 }
 
@@ -1036,6 +1177,9 @@ function bindCurrentView() {
   const editWordForm = document.getElementById("editWordForm");
   if (editWordForm) editWordForm.addEventListener("submit", handleEditWordSave);
 
+  const passwordPromptForm = document.getElementById("passwordPromptForm");
+  if (passwordPromptForm) passwordPromptForm.addEventListener("submit", handlePasswordPromptSave);
+
   const typedAnswer = document.getElementById("typedAnswer");
   if (typedAnswer && !typedAnswer.disabled) {
     typedAnswer.focus();
@@ -1055,6 +1199,9 @@ function handleAction(event) {
   if (action === "toggle-theme") toggleTheme();
   if (action === "open-settings") openSettings();
   if (action === "close-modal") closeModal();
+  if (action === "modal-confirm") confirmModalAction();
+  if (action === "review-lower-level") resolveReviewLevelDecision("down");
+  if (action === "review-keep-level") resolveReviewLevelDecision("keep");
   if (action === "set-word-entry-mode") setWordEntryMode(button.dataset.mode);
   if (action === "reset-password") resetUserPassword(button.dataset.username);
   if (action === "delete-user") deleteUser(button.dataset.username);
@@ -1080,6 +1227,7 @@ function handleAction(event) {
   if (action === "cancel-study") cancelStudy();
   if (action === "import-pending-share") importPendingShare();
   if (action === "dismiss-pending-share") dismissPendingShare();
+  if (action === "import-file-to-folder") importSharedFileToFolder(button.dataset.folderId);
   if (action === "copy-modal-link") copyModalLink();
 }
 
@@ -1159,23 +1307,25 @@ function resetUserPassword(username) {
   const user = state.users[username];
   if (!user) return;
 
-  const password = prompt(`Mật khẩu mới cho ${username}:`);
-  if (!password) return;
-
-  user.password = password;
-  saveState();
-  showToast("Đã đổi mật khẩu user.");
-  render();
+  openPasswordPrompt(username);
 }
 
 function deleteUser(username) {
   if (!state.users[username]) return;
-  if (!confirm(`Xóa user "${username}" và toàn bộ workspace?`)) return;
 
-  delete state.users[username];
-  saveState();
-  showToast("Đã xóa user.");
-  render();
+  openConfirmModal({
+    title: "Xóa user?",
+    message: `Xóa user "${username}" và toàn bộ workspace của user này?`,
+    confirmText: "Xóa user",
+    variant: "danger",
+    icon: "trash-2",
+    onConfirm: () => {
+      delete state.users[username];
+      saveState();
+      showToast("Đã xóa user.");
+      render();
+    }
+  });
 }
 
 function handleCreateFolder(event) {
@@ -1202,16 +1352,24 @@ function deleteFolder(folderId) {
   const user = currentUser();
   const folder = findFolder(user, folderId);
   if (!folder) return;
-  if (!confirm(`Xóa folder "${folder.name}" và mọi file bên trong?`)) return;
 
-  user.folders = user.folders.filter(item => item.id !== folderId);
-  saveState();
-  showToast("Đã xóa folder.");
-  if (route.view === "folder" && route.folderId === folderId) {
-    navigate({ view: "home" }, false);
-  } else {
-    render();
-  }
+  openConfirmModal({
+    title: "Xóa folder?",
+    message: `Xóa folder "${folder.name}" và mọi file bên trong?`,
+    confirmText: "Xóa folder",
+    variant: "danger",
+    icon: "folder-x",
+    onConfirm: () => {
+      user.folders = user.folders.filter(item => item.id !== folderId);
+      saveState();
+      showToast("Đã xóa folder.");
+      if (route.view === "folder" && route.folderId === folderId) {
+        navigate({ view: "home" }, false);
+      } else {
+        render();
+      }
+    }
+  });
 }
 
 function handleCreateFile(event) {
@@ -1240,21 +1398,221 @@ function deleteFile(folderId, fileId) {
   const folder = findFolder(user, folderId);
   const file = folder ? findFile(folder, fileId) : null;
   if (!folder || !file) return;
-  if (!confirm(`Xóa file "${file.name}"?`)) return;
 
-  folder.files = folder.files.filter(item => item.id !== fileId);
-  saveState();
-  showToast("Đã xóa file.");
-  if (route.view === "file" && route.fileId === fileId) {
-    navigate({ view: "folder", folderId }, false);
-  } else {
-    render();
-  }
+  openConfirmModal({
+    title: "Xóa file?",
+    message: `Xóa file "${file.name}"?`,
+    confirmText: "Xóa file",
+    variant: "danger",
+    icon: "file-x-2",
+    onConfirm: () => {
+      folder.files = folder.files.filter(item => item.id !== fileId);
+      saveState();
+      showToast("Đã xóa file.");
+      if (route.view === "file" && route.fileId === fileId) {
+        navigate({ view: "folder", folderId }, false);
+      } else {
+        render();
+      }
+    }
+  });
 }
 
 function setWordEntryMode(mode) {
-  wordEntryMode = mode === "bulk" ? "bulk" : "manual";
-  render();
+  const nextMode = mode === "bulk" ? "bulk" : "manual";
+  if (wordEntryMode === nextMode) return;
+  const previousMode = wordEntryMode;
+  wordEntryMode = nextMode;
+
+  const tabs = document.querySelector(".entry-tabs");
+  const content = document.querySelector(".word-entry-content");
+  const entryPanel = content?.closest(".word-entry-panel");
+  const listPanel = document.querySelector(".word-list-panel");
+
+  if (!tabs || !content) {
+    render();
+    return;
+  }
+
+  clearWordEntryMorph(content, entryPanel, listPanel);
+
+  tabs.dataset.active = nextMode;
+  tabs.querySelectorAll("button[data-mode]").forEach(button => {
+    button.classList.toggle("active", button.dataset.mode === nextMode);
+  });
+
+  tabs.classList.remove("is-fading");
+  void tabs.offsetWidth;
+  tabs.classList.add("is-fading");
+  clearTimeout(tabs.morphTimer);
+  tabs.morphTimer = setTimeout(() => {
+    tabs.classList.remove("is-fading");
+  }, 260);
+
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    content.classList.remove(previousMode, "manual", "bulk", "entry-swap");
+    content.classList.add(nextMode);
+    content.innerHTML = renderWordEntryFields(nextMode);
+    return;
+  }
+
+  const currentHeight = content.getBoundingClientRect().height;
+  const panelStartHeight = entryPanel ? entryPanel.getBoundingClientRect().height : 0;
+  const form = document.getElementById("addWordForm");
+  const ghost = createWordEntryGhost(content, form, currentHeight, previousMode);
+
+  if (entryPanel) {
+    entryPanel.style.overflow = "hidden";
+    entryPanel.classList.add("is-morph-resizing");
+  }
+
+  if (listPanel) {
+    listPanel.classList.add("is-following-entry");
+  }
+
+  content.style.overflow = "hidden";
+  content.classList.add("entry-transitioning");
+  content.classList.remove(previousMode, "manual", "bulk", "entry-swap");
+  content.classList.add(nextMode);
+  content.innerHTML = renderWordEntryFields(nextMode);
+
+  content.style.height = "auto";
+  content.style.opacity = "1";
+  content.style.transform = "translateY(0) scaleY(1)";
+  const targetHeight = content.scrollHeight;
+  content.style.height = `${targetHeight}px`;
+  const panelTargetHeight = entryPanel ? entryPanel.scrollHeight : 0;
+
+  content.style.height = `${currentHeight}px`;
+  if (entryPanel) entryPanel.style.height = `${panelStartHeight}px`;
+
+  void content.offsetHeight;
+  if (entryPanel) void entryPanel.offsetHeight;
+
+  const duration = 520;
+  const direction = targetHeight >= currentHeight ? 1 : -1;
+  const runId = uid();
+  content.entryMorphId = runId;
+  content.entryAnimations = [];
+
+  const finishMorph = () => {
+    if (content.entryMorphId !== runId) return;
+    clearTimeout(content.entryTimer);
+    cancelAnimationFrame(content.entryFrame);
+    clearInterval(content.entryInterval);
+    content.entryFrame = null;
+    content.entryInterval = null;
+    content.entryMorphId = null;
+    content.entryAnimations = null;
+    ghost?.remove();
+    content.classList.remove("entry-transitioning");
+    content.style.height = "";
+    content.style.overflow = "";
+    content.style.opacity = "";
+    content.style.transform = "";
+    if (entryPanel) {
+      entryPanel.classList.remove("is-morph-resizing");
+      entryPanel.style.height = "";
+      entryPanel.style.overflow = "";
+    }
+    if (listPanel) {
+      listPanel.classList.remove("is-following-entry");
+    }
+  };
+
+  const startTime = performance.now();
+  const easeFade = value => 1 - Math.pow(1 - value, 3);
+  const mix = (start, end, amount) => start + (end - start) * amount;
+  let framePending = false;
+  const step = now => {
+    if (content.entryMorphId !== runId) return;
+
+    const progress = Math.min(1, (now - startTime) / duration);
+    const fade = easeFade(progress);
+    const contentHeight = mix(currentHeight, targetHeight, progress);
+    const panelHeight = mix(panelStartHeight, panelTargetHeight, progress);
+    const offset = direction * (1 - fade) * 5;
+    const newScale = mix(direction > 0 ? 0.992 : 1.006, 1, fade);
+    const oldScale = mix(1, direction > 0 ? 1.006 : 0.992, fade);
+
+    content.style.height = `${contentHeight}px`;
+    content.style.opacity = `${fade}`;
+    content.style.transform = `translateY(${offset}px) scaleY(${newScale})`;
+
+    if (entryPanel) {
+      entryPanel.style.height = `${panelHeight}px`;
+    }
+
+    if (ghost) {
+      ghost.style.height = `${contentHeight}px`;
+      ghost.style.opacity = `${1 - fade}`;
+      ghost.style.transform = `translateY(${-offset}px) scaleY(${oldScale})`;
+    }
+
+    if (progress < 1) {
+      scheduleFrame();
+    } else {
+      finishMorph();
+    }
+  };
+
+  const scheduleFrame = () => {
+    if (framePending || content.entryMorphId !== runId) return;
+    framePending = true;
+    content.entryFrame = requestAnimationFrame(now => {
+      framePending = false;
+      step(now);
+    });
+  };
+
+  content.entryInterval = setInterval(() => step(performance.now()), 32);
+  scheduleFrame();
+  content.entryTimer = setTimeout(finishMorph, duration + 140);
+}
+
+function clearWordEntryMorph(content, entryPanel, listPanel) {
+  if (!content) return;
+
+  clearTimeout(content.entryTimer);
+  cancelAnimationFrame(content.entryFrame);
+  clearInterval(content.entryInterval);
+  content.entryFrame = null;
+  content.entryInterval = null;
+  content.entryMorphId = null;
+  content.entryAnimations?.forEach(animation => animation.cancel());
+  content.entryAnimations = null;
+  document.querySelector(".word-entry-ghost")?.remove();
+
+  content.classList.remove("entry-transitioning");
+  content.style.height = "";
+  content.style.overflow = "";
+  content.style.opacity = "";
+  content.style.transform = "";
+
+  if (entryPanel) {
+    entryPanel.classList.remove("is-morph-resizing");
+    entryPanel.style.height = "";
+    entryPanel.style.overflow = "";
+  }
+
+  if (listPanel) {
+    listPanel.classList.remove("is-following-entry");
+  }
+}
+
+function createWordEntryGhost(content, form, currentHeight, previousMode) {
+  if (!form) return null;
+
+  const formRect = form.getBoundingClientRect();
+  const contentRect = content.getBoundingClientRect();
+  const ghost = content.cloneNode(true);
+  ghost.className = `word-entry-ghost ${previousMode}`;
+  ghost.style.left = `${contentRect.left - formRect.left}px`;
+  ghost.style.top = `${contentRect.top - formRect.top}px`;
+  ghost.style.width = `${contentRect.width}px`;
+  ghost.style.height = `${currentHeight}px`;
+  form.appendChild(ghost);
+  return ghost;
 }
 
 function handleAddWord(event) {
@@ -1283,7 +1641,7 @@ function handleAddWord(event) {
   if (wordEntryMode === "bulk") {
     const bulk = document.getElementById("bulkWords").value.trim();
     if (!bulk) {
-      showToast("Nhập ít nhất một dòng theo định dạng english - nghĩa.");
+      showToast("Nhập ít nhất một dòng theo định dạng english: nghĩa.");
       return;
     }
 
@@ -1294,7 +1652,7 @@ function handleAddWord(event) {
   }
 
   if (added === 0) {
-    showToast("Không tìm thấy dòng hợp lệ. Ví dụ: happy - Vui vẻ");
+    showToast("Không tìm thấy dòng hợp lệ. Ví dụ: happy: Vui vẻ");
     return;
   }
 
@@ -1324,13 +1682,30 @@ function parseBulkWords(text) {
     .split(/\n+/)
     .map(line => line.trim())
     .filter(Boolean)
-    .map(line => {
-      const parts = line.split(/\s[-–—|,]\s|[-–—|,]/);
-      const term = (parts.shift() || "").trim();
-      const meaning = parts.join(" ").trim();
-      return { term, meaning };
-    })
+    .map(parseBulkLine)
     .filter(item => item.term && item.meaning);
+}
+
+function parseBulkLine(line) {
+  const separated = line.match(/^(.+?)\s*[:：]\s*(.+)$/)
+    || line.match(/^(.+?)\s+[-–—|,]\s+(.+)$/)
+    || line.match(/^(.+?)\s*[-–—|,]\s*(.+)$/)
+    || line.match(/^(.+?)\s{2,}(.+)$/);
+
+  if (separated) {
+    return {
+      term: separated[1].trim(),
+      meaning: separated[2].trim()
+    };
+  }
+
+  const words = line.split(/\s+/);
+  if (words.length < 2) return { term: "", meaning: "" };
+
+  return {
+    term: words[0].trim(),
+    meaning: words.slice(1).join(" ").trim()
+  };
 }
 
 function openEditWordModal(folderId, fileId, wordId) {
@@ -1429,16 +1804,35 @@ function importSharePayload(payload) {
   }
 
   if (payload.type === "file") {
-    const folder = getOrCreateSharedFolder(user);
-    const file = cloneFileForImport(payload.data, payload.owner);
-    folder.files.unshift(file);
-    saveState();
-    showToast("Đã import file vào folder Shared imports.");
+    modal = {
+      type: "import-file-target",
+      payload,
+      fileName: payload.data?.name || "File được chia sẻ"
+    };
     render();
     return;
   }
 
   showToast("Link chia sẻ không hợp lệ.");
+}
+
+function importSharedFileToFolder(folderId) {
+  if (!modal || modal.type !== "import-file-target") return;
+
+  const user = currentUser();
+  const folder = user ? findFolder(user, folderId) : null;
+
+  if (!folder) {
+    showToast("Không tìm thấy folder đã chọn.");
+    return;
+  }
+
+  const file = cloneFileForImport(modal.payload.data, modal.payload.owner);
+  folder.files.unshift(file);
+  saveState();
+  modal = null;
+  showToast(`Đã import file vào folder ${folder.name}.`);
+  render();
 }
 
 function shareFolder(folderId) {
@@ -1517,6 +1911,54 @@ function openSettings() {
 
 function closeModal() {
   modal = null;
+  render();
+}
+
+function openConfirmModal({ title, message, confirmText = "OK", cancelText = "Cancel", variant = "primary", icon = "circle-help", onConfirm }) {
+  modal = {
+    type: "confirm",
+    title,
+    message,
+    confirmText,
+    cancelText,
+    variant,
+    icon,
+    onConfirm
+  };
+  render();
+}
+
+function confirmModalAction() {
+  if (!modal || modal.type !== "confirm") return;
+  const onConfirm = modal.onConfirm;
+  modal = null;
+  if (typeof onConfirm === "function") {
+    onConfirm();
+    return;
+  }
+  render();
+}
+
+function openPasswordPrompt(username) {
+  modal = {
+    type: "password-prompt",
+    username
+  };
+  render();
+}
+
+function handlePasswordPromptSave(event) {
+  event.preventDefault();
+  if (!modal || modal.type !== "password-prompt") return;
+
+  const user = state.users[modal.username];
+  const password = document.getElementById("passwordPromptInput").value.trim();
+  if (!user || !password) return;
+
+  user.password = password;
+  saveState();
+  modal = null;
+  showToast("Đã đổi mật khẩu user.");
   render();
 }
 
@@ -1628,15 +2070,18 @@ function handleTypeAnswer(event) {
   const answer = document.getElementById("typedAnswer").value;
   const correct = normalizeAnswer(answer) === normalizeAnswer(task.word.term);
   const message = correct
-    ? "Đúng rồi."
-    : `Chưa đúng. Đáp án: ${task.word.term}. Hãy gõ lại đúng đáp án để tiếp tục.`;
+    ? "Đúng"
+    : `đáp án: ${task.word.term}`;
 
-  recordResult(task, correct);
+  const result = recordResult(task, correct);
   activeStudy.feedback = { correct, message, retry: !correct };
+  const needsDecision = maybeAskReviewLevelDecision(task, result, correct);
   render();
 
   if (correct) {
     scheduleStudyAuto(nextTask, 700);
+  } else if (!needsDecision) {
+    scheduleStudyAuto(deferCurrentTask, 1200);
   }
 }
 
@@ -1645,29 +2090,65 @@ function handleChoiceAnswer(choice) {
   const task = activeStudy.tasks[activeStudy.index];
   const correct = choice === task.word.term;
   const message = correct
-    ? "Đúng rồi."
-    : `Chưa đúng. Đáp án: ${task.word.term}.`;
+    ? "Đúng"
+    : `đáp án: ${task.word.term}`;
 
-  recordResult(task, correct);
+  const result = recordResult(task, correct);
   activeStudy.feedback = { correct, selected: choice, message };
+  const needsDecision = maybeAskReviewLevelDecision(task, result, correct);
   render();
 
   if (correct) {
     scheduleStudyAuto(nextTask, 700);
-  } else {
-    scheduleStudyAuto(retryCurrentTask, 1200);
+  } else if (!needsDecision) {
+    scheduleStudyAuto(deferCurrentTask, 1200);
   }
 }
 
 function recordResult(task, correct) {
-  const result = activeStudy.results[task.wordId] || { correct: 0, total: 0, wrong: false };
+  const result = activeStudy.results[task.wordId] || { correct: 0, total: 0, wrong: false, wrongCount: 0, levelDecision: null, levelDecisionAsked: false };
   result.total += 1;
   if (correct) {
     result.correct += 1;
   } else {
     result.wrong = true;
+    result.wrongCount = (result.wrongCount || 0) + 1;
   }
   activeStudy.results[task.wordId] = result;
+  return result;
+}
+
+function maybeAskReviewLevelDecision(task, result, correct) {
+  if (correct || !activeStudy || activeStudy.mode !== "review") return false;
+  if ((result.wrongCount || 0) <= 3 || result.levelDecisionAsked) return false;
+
+  result.levelDecisionAsked = true;
+  activeStudy.results[task.wordId] = result;
+  modal = {
+    type: "review-level-decision",
+    wordId: task.wordId,
+    term: task.word.term
+  };
+  clearStudyAutoTimer();
+  return true;
+}
+
+function resolveReviewLevelDecision(decision) {
+  if (!modal || modal.type !== "review-level-decision") return;
+  const wordId = modal.wordId;
+  const result = activeStudy?.results?.[wordId];
+
+  if (result) {
+    result.levelDecision = decision === "down" ? "down" : "keep";
+    activeStudy.results[wordId] = result;
+  }
+
+  modal = null;
+  render();
+
+  if (activeStudy?.feedback && !activeStudy.feedback.correct) {
+    scheduleStudyAuto(deferCurrentTask, 600);
+  }
 }
 
 function nextTask() {
@@ -1684,28 +2165,47 @@ function nextTask() {
   render();
 }
 
-function retryCurrentTask() {
+function deferCurrentTask() {
   if (!activeStudy) return;
   clearStudyAutoTimer();
+
+  if (activeStudy.tasks.length > 1) {
+    const [task] = activeStudy.tasks.splice(activeStudy.index, 1);
+    activeStudy.tasks.push(task);
+    if (activeStudy.index >= activeStudy.tasks.length) {
+      activeStudy.index = activeStudy.tasks.length - 1;
+    }
+  }
+
   activeStudy.feedback = null;
   render();
 }
 
 function cancelStudy() {
   if (!activeStudy) return;
-  if (!confirm("Hủy phiên học hiện tại? Tiến độ phiên này sẽ không được tính.")) return;
 
-  clearStudyAutoTimer();
-  activeStudy = null;
-  goBack();
+  openConfirmModal({
+    title: "Hủy phiên học?",
+    message: "Tiến độ phiên học hiện tại sẽ không được tính.",
+    confirmText: "Hủy phiên",
+    variant: "danger",
+    icon: "x-circle",
+    onConfirm: () => {
+      clearStudyAutoTimer();
+      activeStudy = null;
+      goBack();
+    }
+  });
 }
 
 function finishStudy() {
   clearStudyAutoTimer();
   const user = currentUser();
-  const now = Date.now();
+  const finishedAt = Date.now();
   let advanced = 0;
   let retried = 0;
+  let lowered = 0;
+  let kept = 0;
 
   activeStudy.words.forEach(ref => {
     const word = findWord(user, ref.folderId, ref.fileId, ref.wordId);
@@ -1714,13 +2214,25 @@ function finishStudy() {
     const result = activeStudy.results[word.id] || { wrong: false };
 
     if (activeStudy.mode === "random") {
-      word.lastPracticedAt = now;
+      word.lastPracticedAt = finishedAt;
       return;
     }
 
     if (result.wrong) retried += 1;
 
-    advanceWord(word, now);
+    if (result.levelDecision === "down") {
+      regressWord(word, finishedAt);
+      lowered += 1;
+      return;
+    }
+
+    if (result.levelDecision === "keep") {
+      keepWordForSoon(word, finishedAt);
+      kept += 1;
+      return;
+    }
+
+    advanceWord(word, finishedAt);
     advanced += 1;
   });
 
@@ -1732,7 +2244,13 @@ function finishStudy() {
   if (mode === "random") {
     showToast("Hoàn thành phiên random.");
   } else {
-    showToast(`Hoàn thành phiên học: ${advanced} từ lên mức${retried ? `, ${retried} từ đã làm lại đúng` : ""}.`);
+    const detail = [
+      `${advanced} từ lên mức`,
+      lowered ? `${lowered} từ lùi level` : "",
+      kept ? `${kept} từ giữ nguyên` : "",
+      retried ? `${retried} từ đã làm lại đúng` : ""
+    ].filter(Boolean).join(", ");
+    showToast(`Hoàn thành phiên học: ${detail}.`);
   }
 }
 
@@ -1765,6 +2283,14 @@ function keepWordForSoon(word, now) {
   if (word.level > 0) {
     word.nextReviewAt = now + 30 * 60 * 1000;
   }
+}
+
+function regressWord(word, now) {
+  const nextLevel = Math.max(1, Number(word.level || 1) - 1);
+  word.level = nextLevel;
+  word.studiedCount = (word.studiedCount || 0) + 1;
+  word.lastStudiedAt = now;
+  word.nextReviewAt = now + REVIEW_INTERVALS[nextLevel];
 }
 
 function getSelectableWords(user, options) {
@@ -1815,6 +2341,28 @@ function getReviewSummary(user, filters = {}) {
     nextReviewAt,
     overdue: false
   };
+}
+
+function getEarliestReviewAt(user, filters = {}) {
+  return getReviewSchedule(user, filters)[0]?.word.nextReviewAt || Number.MAX_SAFE_INTEGER;
+}
+
+function sortFoldersForDisplay(user) {
+  return [...user.folders].sort((a, b) => {
+    const aTime = getEarliestReviewAt(user, { folderId: a.id });
+    const bTime = getEarliestReviewAt(user, { folderId: b.id });
+    if (aTime !== bTime) return aTime - bTime;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+}
+
+function sortFilesForDisplay(user, folder) {
+  return [...folder.files].sort((a, b) => {
+    const aTime = getEarliestReviewAt(user, { folderId: folder.id, fileId: a.id });
+    const bTime = getEarliestReviewAt(user, { folderId: folder.id, fileId: b.id });
+    if (aTime !== bTime) return aTime - bTime;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
 }
 
 function sortWordsForDisplay(words) {
@@ -1917,12 +2465,12 @@ function metricCard(title, value, label) {
 
 function actionCard(title, subtitle, icon, action, disabled = false) {
   return `
-    <article class="item-card">
+    <article class="item-card action-card ${disabled ? "is-disabled" : ""}">
       <span class="role-icon"><i data-lucide="${icon}"></i></span>
       <h3>${title}</h3>
       <p>${subtitle}</p>
       <div class="item-card-footer">
-        <button class="btn primary" data-action="${action}" ${disabled ? "disabled" : ""}>
+        <button class="btn primary start-btn" data-action="${action}" ${disabled ? "disabled" : ""}>
           <i data-lucide="arrow-right"></i>Bắt đầu
         </button>
       </div>
@@ -1973,6 +2521,32 @@ function renderReviewSummary(summary) {
         data-countdown="${summary.nextReviewAt}"
         data-review-count="${summary.count}"
       >${escapeHtml(message)}</strong>
+    </article>
+  `;
+}
+
+function renderReviewClockPanel(summary, title, subtitle) {
+  return `
+    <section class="panel review-clock-panel ${summary ? "" : "is-empty"}">
+      <div class="panel-header review-clock-header">
+        <span class="review-clock-icon"><i data-lucide="timer"></i></span>
+        <div>
+          <h2>${escapeHtml(title)}</h2>
+          <p>${escapeHtml(subtitle)}</p>
+        </div>
+      </div>
+      ${summary ? renderReviewSummary(summary) : renderEmptyReviewClock()}
+    </section>
+  `;
+}
+
+function renderEmptyReviewClock() {
+  return `
+    <article class="review-clock-empty">
+      <div>
+        <h3>Chưa có lịch ôn tập</h3>
+        <p>Sau khi học từ mới, app sẽ tự tạo đồng hồ đếm ngược cho lần ôn tiếp theo.</p>
+      </div>
     </article>
   `;
 }
@@ -2225,15 +2799,16 @@ function formatCountdown(timestamp) {
   if (diff <= 0) return "Đến hạn ôn";
 
   const totalSeconds = Math.floor(diff / 1000);
-  const days = Math.floor(totalSeconds / 86400);
-  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const daySeconds = 24 * 60 * 60;
+  if (totalSeconds >= daySeconds) {
+    return `${Math.ceil(totalSeconds / daySeconds)} ngày`;
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
 
-  if (days > 0) return `${days} ngày ${hours} giờ`;
-  if (hours > 0) return `${hours} giờ ${minutes} phút`;
-  if (minutes > 0) return `${minutes} phút ${seconds} giây`;
-  return `${seconds} giây`;
+  return `${hours} giờ ${minutes} phút ${seconds} giây`;
 }
 
 function startCountdownClock() {
