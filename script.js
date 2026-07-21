@@ -1,21 +1,45 @@
 const app = document.getElementById("app");
 const toast = document.getElementById("toast");
 
-const ADMIN = {
-  username: "BaoKhang",
-  password: "Kn6761617"
-};
-
 const STORE_KEY = "baoKhangVocabState.v1";
 const SESSION_KEY = "baoKhangVocabSession.v1";
+const ADMIN_STATE_KEY = "baoKhangVocabAdminState.v1";
 const THEME_KEY = "baoKhangVocabTheme.v1";
 
 // Google Apps Script Web App endpoint for per-user JSON sync.
-// Token/secret must stay inside Apps Script, not in public GitHub files.
+// Keep Drive folder IDs, admin password, and private tokens inside Apps Script.
 const CLOUD_SYNC_URL = "https://script.google.com/macros/s/AKfycbz9xxUk6vWa2tFEVcvRDscp3Ml36Va9CyThsZ9-2WV6pe9sWdRM9Zw2xeO9I5nsqTwK/exec";
-const CLOUD_FOLDER_ID = "1-Y1_DzW6zVNQFvTzhmFEUXoolb-efxeu";
-const CLOUD_SYNC_TOKEN = "60QcQXXdkwxhLMiTXRaLX/ZnAsnDSRumRRwoY6kCbXw=";
-const CLOUD_STATE_FILE = "baokhang-vocab-users.json";
+
+const SECURITY_LIMITS = Object.freeze({
+  usernameLength: 40,
+  passwordLength: 128,
+  nameLength: 120,
+  termLength: 120,
+  meaningLength: 300,
+  exampleLength: 1000,
+  bulkCharacters: 200000,
+  bulkLines: 1000,
+  shareCharacters: 750000,
+  users: 500,
+  foldersPerUser: 250,
+  filesPerFolder: 500,
+  wordsPerFile: 5000,
+  cloudPayloadBytes: 5 * 1024 * 1024,
+  cloudTimeoutMs: 20000
+});
+
+const USERNAME_PATTERN = /^[A-Za-z0-9._-]{2,40}$/;
+const USER_VIEWS = new Set(["home", "folder", "file", "randomSetup", "study"]);
+const PUBLIC_ACTIONS = new Set(["login-admin", "login-user", "back", "toggle-theme", "close-modal"]);
+const ADMIN_ACTIONS = new Set(["reset-password", "delete-user"]);
+const USER_ACTIONS = new Set([
+  "open-settings", "set-word-entry-mode", "open-folder", "delete-folder", "share-folder",
+  "open-file", "delete-file", "share-file", "edit-word", "delete-word", "start-new",
+  "start-review", "open-random", "start-new-folder", "start-review-folder", "open-random-folder",
+  "start-new-file", "start-review-file", "open-random-file", "choose-answer", "next-task",
+  "cancel-study", "import-pending-share", "dismiss-pending-share", "import-file-to-folder",
+  "copy-modal-link", "review-lower-level", "review-keep-level"
+]);
 
 const DEFAULT_SETTINGS = {
   newWordsPerSession: 10,
@@ -32,6 +56,9 @@ const LEVELS = [
   { key: "lv5", label: "LV5", level: 5 },
   { key: "mastered", label: "mastered", level: 6 }
 ];
+const LEVEL_KEY_BY_NUMBER = Object.freeze(
+  Object.fromEntries(LEVELS.map(item => [item.level, item.key]))
+);
 
 const REVIEW_INTERVALS = {
   1: 60 * 60 * 1000,
@@ -55,8 +82,8 @@ const FALLBACK_CHOICES = [
   "wonder"
 ];
 
-let state = loadState();
 let session = loadSession();
+let state = loadState();
 let routeStack = [];
 let route = getInitialRoute();
 let modal = null;
@@ -67,18 +94,28 @@ let studyAutoTimer = null;
 let countdownTimer = null;
 let cloudSyncTimer = null;
 let isCloudSyncing = false;
+let isLoginPending = false;
+let lastRenderedRouteKey = "";
 
 applyTheme();
+bindAppEvents();
 render();
 
 function loadState() {
+  if (!session) {
+    localStorage.removeItem(STORE_KEY);
+    sessionStorage.removeItem(ADMIN_STATE_KEY);
+    return { users: {} };
+  }
+
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (parsed && typeof parsed === "object") {
-      parsed.users = parsed.users || {};
-      Object.values(parsed.users).forEach(ensureUserShape);
-      return parsed;
-    }
+    const storage = session?.type === "admin" ? sessionStorage : localStorage;
+    const key = session?.type === "admin" ? ADMIN_STATE_KEY : STORE_KEY;
+    const parsed = JSON.parse(storage.getItem(key));
+    const cleanState = normalizeState(parsed, session?.type === "user" ? session.username : null);
+    storage.setItem(key, JSON.stringify(cleanState));
+    if (session?.type === "admin") localStorage.removeItem(STORE_KEY);
+    return cleanState;
   } catch (error) {
     console.warn("Could not load saved state", error);
   }
@@ -88,7 +125,15 @@ function loadState() {
 
 function loadSession() {
   try {
-    return JSON.parse(localStorage.getItem(SESSION_KEY)) || null;
+    localStorage.removeItem(SESSION_KEY);
+    const parsed = JSON.parse(sessionStorage.getItem(SESSION_KEY));
+    if (!parsed || !["admin", "user"].includes(parsed.type)) return null;
+    if (!parsed.cloudToken || Number(parsed.expiresAt || 0) <= Date.now()) {
+      sessionStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    if (!isValidUsername(parsed.username)) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -100,39 +145,61 @@ function saveState() {
 }
 
 function persistStateOnly() {
-  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  if (session?.type === "admin") {
+    const cleanState = normalizeState(state);
+    sessionStorage.setItem(ADMIN_STATE_KEY, JSON.stringify(cleanState));
+    localStorage.removeItem(STORE_KEY);
+    return;
+  }
+
+  if (session?.type === "user") {
+    const user = currentUser();
+    if (user) {
+      localStorage.setItem(STORE_KEY, JSON.stringify({ users: { [user.username]: user } }));
+    }
+    sessionStorage.removeItem(ADMIN_STATE_KEY);
+    return;
+  }
+
+  localStorage.removeItem(STORE_KEY);
+  sessionStorage.removeItem(ADMIN_STATE_KEY);
 }
 
 function saveSession() {
   if (!session) {
-    localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(SESSION_KEY);
     return;
   }
 
-  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
 }
 
 function hasCloudSync() {
-  return CLOUD_SYNC_URL.trim().length > 0;
+  try {
+    const url = new URL(CLOUD_SYNC_URL.trim());
+    return url.protocol === "https:" && url.hostname === "script.google.com";
+  } catch {
+    return false;
+  }
+}
+
+function hasCloudSession() {
+  return Boolean(session?.cloudToken);
 }
 
 function queueCloudSync() {
-  if (!hasCloudSync() || !session) return;
+  if (!hasCloudSync() || session?.type !== "user" || !hasCloudSession()) return;
 
   clearTimeout(cloudSyncTimer);
   cloudSyncTimer = setTimeout(syncCurrentWorkspaceToCloud, 900);
 }
 
 async function syncCurrentWorkspaceToCloud() {
-  if (!hasCloudSync() || isCloudSyncing || !session) return;
+  if (!hasCloudSync() || isCloudSyncing || session?.type !== "user" || !hasCloudSession()) return;
 
   isCloudSyncing = true;
   try {
-    if (session.type === "user") {
-      await saveUserToCloud(currentUser());
-    } else {
-      await saveAllUsersToCloud();
-    }
+    await saveUserToCloud(currentUser());
   } catch (error) {
     console.warn("Cloud sync failed", error);
   } finally {
@@ -146,22 +213,9 @@ async function saveUserToCloud(user) {
   return cloudSave(cloudUserFileName(user.username), {
     type: "userWorkspace",
     username: user.username,
-    user,
+    user: serializeUserForCloud(user),
     updatedAt: Date.now()
   });
-}
-
-async function saveAllUsersToCloud() {
-  await cloudSave(CLOUD_STATE_FILE, {
-    type: "appState",
-    admin: ADMIN.username,
-    state,
-    updatedAt: Date.now()
-  });
-
-  for (const user of Object.values(state.users || {})) {
-    await saveUserToCloud(user);
-  }
 }
 
 function cloudUserFileName(username) {
@@ -171,40 +225,57 @@ function cloudUserFileName(username) {
   return `${safeName || "user"}.json`;
 }
 
-async function cloudLoad(filename) {
-  return cloudRequest({
-    action: "load",
-    filename
-  });
-}
-
 async function cloudSave(filename, data) {
-  const content = JSON.stringify(data, null, 2);
   return cloudRequest({
     action: "save",
     filename,
-    mimeType: "application/json",
-    contentType: "application/json",
-    content,
-    data,
-    payload: data
+    data
   });
 }
 
-async function cloudRequest(payload) {
-  const response = await fetch(CLOUD_SYNC_URL.trim(), {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain;charset=utf-8"
-    },
-    body: JSON.stringify({
+function cloudAuthPayload() {
+  if (!hasCloudSession()) return {};
+
+  return {
+    sessionToken: session.cloudToken,
+    role: session.type,
+    username: session.username
+  };
+}
+
+async function cloudRequest(payload, options = {}) {
+  const body = JSON.stringify({
       app: "BaoKhangVocab",
-      folderId: CLOUD_FOLDER_ID,
-      token: CLOUD_SYNC_TOKEN,
       sentAt: Date.now(),
+      ...(options.skipAuth ? {} : (options.auth || cloudAuthPayload())),
       ...payload
-    })
   });
+
+  if (new TextEncoder().encode(body).byteLength > SECURITY_LIMITS.cloudPayloadBytes) {
+    throw new Error("Dữ liệu đồng bộ vượt quá giới hạn an toàn.");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SECURITY_LIMITS.cloudTimeoutMs);
+  let response;
+  try {
+    response = await fetch(CLOUD_SYNC_URL.trim(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=utf-8"
+      },
+      body,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("Đồng bộ quá thời gian chờ.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const text = await response.text();
   let data = {};
@@ -215,113 +286,150 @@ async function cloudRequest(payload) {
   }
 
   if (!response.ok || data.success === false) {
+    if (/session expired|session invalid/i.test(String(data.error || ""))) {
+      logout(false);
+    }
     throw new Error(data.error || "Cloud sync error");
   }
 
   return data;
 }
 
-function readCloudPayload(data) {
-  const raw = data?.data ?? data?.content ?? data?.payload ?? null;
-  if (typeof raw === "string") {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return null;
-    }
-  }
-
-  return raw && typeof raw === "object" ? raw : null;
-}
-
 async function hydrateFromCloudLogin({ role, username, password }) {
-  if (!hasCloudSync()) return false;
+  if (!hasCloudSync()) return { success: false };
 
   try {
-    const files = role === "admin"
-      ? [CLOUD_STATE_FILE]
-      : [cloudUserFileName(username), CLOUD_STATE_FILE];
+    const data = await cloudRequest({
+      action: "login",
+      role,
+      username,
+      password
+    }, { skipAuth: true });
 
-    for (const filename of files) {
-      const data = await cloudLoad(filename);
-      if (data.success === false || data.exists === false) continue;
-
-      const payload = readCloudPayload(data);
-      if (!payload) continue;
-
-      const cloudState = payload.state || (payload.users ? { users: payload.users } : null);
-      if (role === "admin" && cloudState?.users) {
-        state = {
-          ...state,
-          ...cloudState,
-          users: cloudState.users || {}
-        };
-        Object.values(state.users).forEach(ensureUserShape);
-        persistStateOnly();
-        return true;
-      }
-
-      const cloudUser = payload.user
-        || payload.users?.[username]
-        || payload.state?.users?.[username]
-        || (payload.username === username ? payload : null);
-
-      if (role === "user" && cloudUser) {
-        state.users[username] = {
-          ...cloudUser,
-          username,
-          password: cloudUser.password || password
-        };
-        ensureUserShape(state.users[username]);
-        persistStateOnly();
-        return true;
-      }
+    if (role === "admin") {
+      state = normalizeState(data.state || { users: {} });
+      persistStateOnly();
+      return {
+        success: true,
+        cloudToken: data.sessionToken,
+        expiresAt: Number(data.expiresAt || 0),
+        username: sanitizeUsername(data.username || username)
+      };
     }
 
-    return false;
+    if (role === "user" && data.user) {
+      const user = data.user;
+      user.username = username;
+      ensureUserShape(user);
+      state = { users: { [username]: user } };
+      persistStateOnly();
+      return {
+        success: true,
+        cloudToken: data.sessionToken,
+        expiresAt: Number(data.expiresAt || 0)
+      };
+    }
+
+    return { success: false };
   } catch (error) {
     console.warn("Cloud login failed", error);
-    return false;
+    return { success: false };
   }
 }
 
 function ensureUserShape(user) {
-  user.settings = { ...DEFAULT_SETTINGS, ...(user.settings || {}) };
-  user.folders = Array.isArray(user.folders) ? user.folders : [];
-  user.createdAt = user.createdAt || Date.now();
+  if (!isPlainObject(user)) return;
+
+  user.username = sanitizeUsername(user.username);
+  delete user.password;
+  delete user.passwordHash;
+  delete user.passwordSalt;
+  delete user.passwordAlgo;
+  user.settings = sanitizeSettings(user.settings);
+  user.folders = Array.isArray(user.folders)
+    ? user.folders.slice(0, SECURITY_LIMITS.foldersPerUser).filter(isPlainObject)
+    : [];
+  user.createdAt = safeTimestamp(user.createdAt, Date.now());
 
   user.folders.forEach(folder => {
-    folder.id = folder.id || uid();
-    folder.name = folder.name || "Untitled folder";
-    folder.createdAt = folder.createdAt || Date.now();
-    folder.files = Array.isArray(folder.files) ? folder.files : [];
+    folder.id = sanitizeId(folder.id);
+    folder.name = sanitizeText(folder.name || "Untitled folder", SECURITY_LIMITS.nameLength);
+    folder.createdAt = safeTimestamp(folder.createdAt, Date.now());
+    folder.files = Array.isArray(folder.files)
+      ? folder.files.slice(0, SECURITY_LIMITS.filesPerFolder).filter(isPlainObject)
+      : [];
 
     folder.files.forEach(file => {
-      file.id = file.id || uid();
-      file.name = file.name || "Untitled file";
-      file.createdAt = file.createdAt || Date.now();
-      file.words = Array.isArray(file.words) ? file.words : [];
+      file.id = sanitizeId(file.id);
+      file.name = sanitizeText(file.name || "Untitled file", SECURITY_LIMITS.nameLength);
+      file.createdAt = safeTimestamp(file.createdAt, Date.now());
+      file.words = Array.isArray(file.words)
+        ? file.words.slice(0, SECURITY_LIMITS.wordsPerFile).filter(isPlainObject)
+        : [];
 
       file.words.forEach(word => {
-        word.id = word.id || uid();
-        word.term = word.term || "";
-        word.meaning = word.meaning || "";
-        word.example = word.example || "";
-        word.level = Number(word.level || 0);
-        word.nextReviewAt = word.nextReviewAt || null;
-        word.createdAt = word.createdAt || Date.now();
-        word.studiedCount = Number(word.studiedCount || 0);
+        word.id = sanitizeId(word.id);
+        word.term = sanitizeText(word.term, SECURITY_LIMITS.termLength);
+        word.meaning = sanitizeText(word.meaning, SECURITY_LIMITS.meaningLength);
+        word.example = sanitizeMultiline(word.example, SECURITY_LIMITS.exampleLength);
+        word.level = clampNumber(word.level, 0, 6);
+        word.nextReviewAt = nullableTimestamp(word.nextReviewAt);
+        word.createdAt = safeTimestamp(word.createdAt, Date.now());
+        word.learnedAt = nullableTimestamp(word.learnedAt);
+        word.lastStudiedAt = nullableTimestamp(word.lastStudiedAt);
+        word.studiedCount = clampNumber(word.studiedCount, 0, 1000000);
       });
     });
   });
 }
 
+function normalizeState(input, onlyUsername = null) {
+  const cleanState = { users: {} };
+  if (!isPlainObject(input) || !isPlainObject(input.users)) return cleanState;
+
+  Object.entries(input.users)
+    .slice(0, SECURITY_LIMITS.users)
+    .forEach(([key, value]) => {
+      if (!isPlainObject(value)) return;
+      const username = sanitizeUsername(value.username || key);
+      if (!isValidUsername(username) || (onlyUsername && username !== onlyUsername)) return;
+      value.username = username;
+      ensureUserShape(value);
+      cleanState.users[username] = value;
+    });
+
+  return cleanState;
+}
+
+function replaceAdminState(nextState) {
+  if (!requireRole("admin")) return;
+  state = normalizeState(nextState || { users: {} });
+  persistStateOnly();
+}
+
+function serializeUserForCloud(user) {
+  if (!isPlainObject(user)) return null;
+  const copy = JSON.parse(JSON.stringify(user));
+  ensureUserShape(copy);
+  return copy;
+}
+
+function sanitizeSettings(settings) {
+  const value = isPlainObject(settings) ? settings : {};
+  return {
+    newWordsPerSession: clampNumber(value.newWordsPerSession ?? DEFAULT_SETTINGS.newWordsPerSession, 1, 100),
+    reviewWordsPerSession: clampNumber(value.reviewWordsPerSession ?? DEFAULT_SETTINGS.reviewWordsPerSession, 1, 100),
+    typeRepetitions: clampNumber(value.typeRepetitions ?? DEFAULT_SETTINGS.typeRepetitions, 0, 20),
+    choiceRepetitions: clampNumber(value.choiceRepetitions ?? DEFAULT_SETTINGS.choiceRepetitions, 0, 20)
+  };
+}
+
 function getInitialRoute() {
-  if (session?.type === "admin") {
+  if (hasActiveSession("admin")) {
     return { view: "admin" };
   }
 
-  if (session?.type === "user" && state.users[session.username]) {
+  if (hasActiveSession("user") && state.users[session.username]) {
     return { view: "home" };
   }
 
@@ -331,6 +439,18 @@ function getInitialRoute() {
 }
 
 function render() {
+  const adminView = route.view === "admin";
+  if ((adminView && !hasActiveSession("admin")) || (USER_VIEWS.has(route.view) && !hasActiveSession("user"))) {
+    session = null;
+    saveSession();
+    routeStack = [];
+    route = { view: "landing" };
+  }
+
+  const routeKey = [route.view, route.role, route.folderId, route.fileId].filter(Boolean).join(":");
+  app.classList.toggle("is-route-changing", routeKey !== lastRenderedRouteKey);
+  lastRenderedRouteKey = routeKey;
+
   const html = {
     landing: renderLanding,
     login: renderLogin,
@@ -356,7 +476,7 @@ function createIcons() {
 
 function animateProgressBars() {
   requestAnimationFrame(() => {
-    document.querySelectorAll("[data-progress-target]").forEach(element => {
+    app.querySelectorAll("[data-progress-target]").forEach(element => {
       element.style.width = `${Number(element.dataset.progressTarget) || 0}%`;
     });
   });
@@ -418,11 +538,11 @@ function renderLogin() {
         <form id="loginForm" class="form-grid" autocomplete="off" data-form-type="other">
           <div class="field full">
             <label for="username">Tên đăng nhập</label>
-            <input id="username" name="bk_user_${isAdmin ? "admin" : "user"}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" placeholder="${isAdmin ? "Tên đăng nhập Admin" : "Tên đăng nhập User"}" required />
+            <input id="username" name="username" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="${SECURITY_LIMITS.usernameLength}" pattern="[A-Za-z0-9._-]{2,40}" placeholder="${isAdmin ? "Tên đăng nhập Admin" : "Tên đăng nhập User"}" required />
           </div>
           <div class="field full">
             <label for="loginSecret">Mật khẩu</label>
-            <input id="loginSecret" class="masked-input" name="bk_secret_${Date.now()}" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Mật khẩu" required />
+            <input id="loginSecret" class="masked-input" name="password" type="password" autocomplete="current-password" maxlength="${SECURITY_LIMITS.passwordLength}" placeholder="Mật khẩu" required />
           </div>
           <div class="form-actions">
             <button class="btn ghost" type="button" data-action="back">Cancel</button>
@@ -439,13 +559,20 @@ function renderLogin() {
 
 function renderAdmin() {
   const users = Object.values(state.users).sort((a, b) => a.username.localeCompare(b.username));
-  const totalWords = users.reduce((sum, user) => sum + getAllWords(user).length, 0);
+  const userMetrics = new Map(users.map(user => {
+    const words = getAllWords(user);
+    return [user.username, {
+      total: words.length,
+      learned: words.reduce((sum, item) => sum + (item.word.level > 0 ? 1 : 0), 0)
+    }];
+  }));
+  const totalWords = [...userMetrics.values()].reduce((sum, metrics) => sum + metrics.total, 0);
 
   return `
     <section class="screen">
       ${topbar({
         title: "Admin Dashboard",
-        subtitle: `Đang đăng nhập: ${ADMIN.username}`,
+        subtitle: `Đang đăng nhập: ${escapeHtml(session.username || "Admin")}`,
         actions: `
           ${themeButton()}
           <button class="btn secondary" data-action="logout"><i data-lucide="log-out"></i>Đăng xuất</button>
@@ -469,11 +596,11 @@ function renderAdmin() {
         <form id="createUserForm" class="form-grid">
           <div class="field">
             <label for="newUsername">Tên đăng nhập</label>
-            <input id="newUsername" required minlength="2" placeholder="Ví dụ: test" />
+            <input id="newUsername" required minlength="2" maxlength="${SECURITY_LIMITS.usernameLength}" pattern="[A-Za-z0-9._-]{2,40}" autocomplete="off" placeholder="Ví dụ: test" />
           </div>
           <div class="field">
             <label for="newPassword">Mật khẩu</label>
-            <input id="newPassword" required minlength="4" placeholder="Tạo mật khẩu" />
+            <input id="newPassword" type="password" autocomplete="new-password" required minlength="4" maxlength="${SECURITY_LIMITS.passwordLength}" placeholder="Tạo mật khẩu" />
           </div>
           <div class="form-actions">
             <button class="btn primary" type="submit"><i data-lucide="user-plus"></i>Tạo user</button>
@@ -491,13 +618,12 @@ function renderAdmin() {
         ${users.length ? `
           <div class="admin-table">
             ${users.map(user => {
-              const words = getAllWords(user);
-              const learned = words.filter(item => item.word.level > 0).length;
+              const metrics = userMetrics.get(user.username);
               return `
                 <article class="admin-row">
                   <div>
-                    <strong>${escapeHtml(user.username)} - ${escapeHtml(user.password)}</strong>
-                    <span>${user.folders.length} folder · ${learned}/${words.length} từ đã học · tạo ${formatDate(user.createdAt)}</span>
+                    <strong>${escapeHtml(user.username)}</strong>
+                    <span>${user.folders.length} folder · ${metrics.learned}/${metrics.total} từ đã học · tạo ${formatDate(user.createdAt)}</span>
                   </div>
                   <div class="row-actions">
                     <button class="btn ghost" data-action="reset-password" data-username="${escapeAttr(user.username)}">
@@ -520,8 +646,8 @@ function renderAdmin() {
 function renderHome() {
   const user = currentUser();
   const stats = getStats(user);
-  const dueCount = getSelectableWords(user, { kind: "review" }).length;
-  const newCount = getSelectableWords(user, { kind: "new" }).length;
+  const dueCount = stats.due;
+  const newCount = stats.new;
   const settings = user.settings;
   const reviewSummary = getReviewSummary(user);
   const sortedFolders = sortFoldersForDisplay(user);
@@ -584,7 +710,7 @@ function renderHome() {
           </div>
         </div>
         <form id="receiveShareForm" class="share-box">
-          <input class="field-input" id="shareInput" placeholder="Dán link chia sẻ vào đây" required />
+          <input class="field-input" id="shareInput" maxlength="${SECURITY_LIMITS.shareCharacters}" placeholder="Dán link chia sẻ vào đây" required />
           <button class="btn primary" type="submit"><i data-lucide="folder-down"></i>Nhận link</button>
         </form>
       </section>
@@ -598,7 +724,7 @@ function renderHome() {
           <form id="createFolderForm" class="inline-actions">
             <div class="search-box">
               <i data-lucide="folder-plus"></i>
-              <input id="folderName" placeholder="Tên folder mới" required />
+              <input id="folderName" maxlength="${SECURITY_LIMITS.nameLength}" placeholder="Tên folder mới" required />
             </div>
             <button class="btn primary" type="submit"><i data-lucide="plus"></i>Tạo folder</button>
           </form>
@@ -636,7 +762,7 @@ function renderFolder() {
         actions: `
           ${themeButton()}
           <button class="icon-btn" title="Settings" aria-label="Settings" data-action="open-settings"><i data-lucide="settings"></i></button>
-          <button class="btn ghost" data-action="share-folder" data-folder-id="${folder.id}"><i data-lucide="share-2"></i>Share folder</button>
+          <button class="btn ghost" data-action="share-folder" data-folder-id="${escapeAttr(folder.id)}"><i data-lucide="share-2"></i>Share folder</button>
         `
       })}
 
@@ -667,7 +793,7 @@ function renderFolder() {
         <form id="createFileForm" class="form-grid">
           <div class="field full">
             <label for="fileName">Tên file mới</label>
-            <input id="fileName" required placeholder="Ví dụ: Unit 1 - Daily routines" />
+            <input id="fileName" maxlength="${SECURITY_LIMITS.nameLength}" required placeholder="Ví dụ: Unit 1 - Daily routines" />
           </div>
           <div class="form-actions">
             <button class="btn ghost" type="button" data-action="back">Cancel</button>
@@ -708,7 +834,7 @@ function renderFile() {
         actions: `
           ${themeButton()}
           <button class="icon-btn" title="Settings" aria-label="Settings" data-action="open-settings"><i data-lucide="settings"></i></button>
-          <button class="btn ghost" data-action="share-file" data-folder-id="${folder.id}" data-file-id="${file.id}"><i data-lucide="share-2"></i>Share file</button>
+          <button class="btn ghost" data-action="share-file" data-folder-id="${escapeAttr(folder.id)}" data-file-id="${escapeAttr(file.id)}"><i data-lucide="share-2"></i>Share file</button>
         `
       })}
 
@@ -775,20 +901,20 @@ function renderWordEntryFields(mode) {
   return mode === "manual" ? `
     <div class="field">
       <label for="wordTerm">Từ tiếng Anh</label>
-      <input id="wordTerm" required placeholder="Ví dụ: happy" />
+      <input id="wordTerm" maxlength="${SECURITY_LIMITS.termLength}" required placeholder="Ví dụ: happy" />
     </div>
     <div class="field">
       <label for="wordMeaning">Định nghĩa tiếng Việt</label>
-      <input id="wordMeaning" required placeholder="Ví dụ: vui vẻ" />
+      <input id="wordMeaning" maxlength="${SECURITY_LIMITS.meaningLength}" required placeholder="Ví dụ: vui vẻ" />
     </div>
     <div class="field full">
       <label for="wordExample">Ví dụ hoặc ghi chú</label>
-      <textarea id="wordExample" placeholder="Tùy chọn"></textarea>
+      <textarea id="wordExample" maxlength="${SECURITY_LIMITS.exampleLength}" placeholder="Tùy chọn"></textarea>
     </div>
   ` : `
     <div class="field full">
       <label for="bulkWords">Nhập mỗi dòng theo định dạng english: nghĩa tiếng Việt</label>
-      <textarea id="bulkWords" required placeholder="happy: Vui vẻ&#10;hello xin chào"></textarea>
+      <textarea id="bulkWords" maxlength="${SECURITY_LIMITS.bulkCharacters}" required placeholder="happy: Vui vẻ&#10;hello xin chào"></textarea>
     </div>
   `;
 }
@@ -905,7 +1031,7 @@ function renderTypeTask(task, feedback) {
       ${feedback ? `
         <div class="field full">
           <div class="feedback prominent ${feedback.correct ? "good" : "bad"}">
-            ${feedback.message}
+            ${escapeHtml(feedback.message)}
           </div>
         </div>
       ` : `
@@ -935,7 +1061,7 @@ function renderChoiceTask(task, feedback) {
     </div>
     ${feedback ? `
       <div class="feedback prominent choice-feedback ${feedback.correct ? "good" : "bad"}">
-        ${feedback.message}
+        ${escapeHtml(feedback.message)}
       </div>
     ` : ""}
   `;
@@ -1010,15 +1136,15 @@ function renderModal() {
           <form id="editWordForm" class="form-grid">
             <div class="field">
               <label for="editWordTerm">Từ tiếng Anh</label>
-              <input id="editWordTerm" value="${escapeAttr(modal.word.term)}" required />
+              <input id="editWordTerm" maxlength="${SECURITY_LIMITS.termLength}" value="${escapeAttr(modal.word.term)}" required />
             </div>
             <div class="field">
               <label for="editWordMeaning">Định nghĩa tiếng Việt</label>
-              <input id="editWordMeaning" value="${escapeAttr(modal.word.meaning)}" required />
+              <input id="editWordMeaning" maxlength="${SECURITY_LIMITS.meaningLength}" value="${escapeAttr(modal.word.meaning)}" required />
             </div>
             <div class="field full">
               <label for="editWordExample">Ví dụ hoặc ghi chú</label>
-              <textarea id="editWordExample">${escapeHtml(modal.word.example || "")}</textarea>
+              <textarea id="editWordExample" maxlength="${SECURITY_LIMITS.exampleLength}">${escapeHtml(modal.word.example || "")}</textarea>
             </div>
             <div class="form-actions">
               <button class="btn ghost" type="button" data-action="close-modal">Cancel</button>
@@ -1061,12 +1187,11 @@ function renderModal() {
               <h2>Đổi mật khẩu</h2>
               <p>Tạo mật khẩu mới cho user ${escapeHtml(modal.username)}.</p>
             </div>
-            <button class="icon-btn" data-action="close-modal" aria-label="Close"><i data-lucide="x"></i></button>
           </div>
           <form id="passwordPromptForm" class="form-grid">
             <div class="field full">
               <label for="passwordPromptInput">Mật khẩu mới</label>
-              <input id="passwordPromptInput" type="text" autocomplete="off" required />
+              <input id="passwordPromptInput" type="password" autocomplete="new-password" minlength="4" maxlength="${SECURITY_LIMITS.passwordLength}" required />
             </div>
             <div class="form-actions">
               <button class="btn ghost" type="button" data-action="close-modal">Cancel</button>
@@ -1142,60 +1267,111 @@ function renderModal() {
   return "";
 }
 
-function bindCurrentView() {
-  app.querySelectorAll("[data-action]").forEach(element => {
-    element.addEventListener("click", handleAction);
+function bindAppEvents() {
+  app.addEventListener("click", handleDelegatedAction);
+  app.addEventListener("submit", handleDelegatedSubmit);
+  document.addEventListener("keydown", handleGlobalKeydown);
+  document.addEventListener("visibilitychange", () => {
+    document.documentElement.classList.toggle("is-page-hidden", document.hidden);
+    if (!document.hidden) startCountdownClock();
   });
+}
 
-  const loginForm = document.getElementById("loginForm");
-  if (loginForm) loginForm.addEventListener("submit", handleLogin);
+function handleGlobalKeydown(event) {
+  if (event.key !== "Enter" || event.repeat || event.isComposing || event.defaultPrevented) return;
 
-  const createUserForm = document.getElementById("createUserForm");
-  if (createUserForm) createUserForm.addEventListener("submit", handleCreateUser);
+  const target = event.target;
+  const actionTarget = target.closest?.("[data-action]");
 
-  const createFolderForm = document.getElementById("createFolderForm");
-  if (createFolderForm) createFolderForm.addEventListener("submit", handleCreateFolder);
+  if (route.view === "login") {
+    if (actionTarget?.dataset.action === "back") return;
+    const loginForm = document.getElementById("loginForm");
+    if (!loginForm || isLoginPending) return;
+    event.preventDefault();
+    loginForm.requestSubmit();
+    return;
+  }
 
-  const receiveShareForm = document.getElementById("receiveShareForm");
-  if (receiveShareForm) receiveShareForm.addEventListener("submit", handleReceiveShare);
+  if (!session || modal || route.view === "study") return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) || target.isContentEditable) return;
+  if (actionTarget && actionTarget.dataset.action !== "logout") return;
 
-  const createFileForm = document.getElementById("createFileForm");
-  if (createFileForm) createFileForm.addEventListener("submit", handleCreateFile);
+  const logoutButton = app.querySelector('[data-action="logout"]');
+  if (!logoutButton || logoutButton.disabled) return;
+  event.preventDefault();
+  logoutButton.click();
+}
 
-  const addWordForm = document.getElementById("addWordForm");
-  if (addWordForm) addWordForm.addEventListener("submit", handleAddWord);
+function handleDelegatedAction(event) {
+  const button = event.target.closest("[data-action]");
+  if (!button || !app.contains(button) || button.disabled) return;
+  handleAction(button);
+}
 
-  const randomForm = document.getElementById("randomForm");
-  if (randomForm) randomForm.addEventListener("submit", handleRandomStart);
+function handleDelegatedSubmit(event) {
+  switch (event.target.id) {
+    case "loginForm": handleLogin(event); break;
+    case "createUserForm": handleCreateUser(event); break;
+    case "createFolderForm": handleCreateFolder(event); break;
+    case "receiveShareForm": handleReceiveShare(event); break;
+    case "createFileForm": handleCreateFile(event); break;
+    case "addWordForm": handleAddWord(event); break;
+    case "randomForm": handleRandomStart(event); break;
+    case "typeAnswerForm": handleTypeAnswer(event); break;
+    case "settingsForm": handleSettingsSave(event); break;
+    case "editWordForm": handleEditWordSave(event); break;
+    case "passwordPromptForm": handlePasswordPromptSave(event); break;
+    default: break;
+  }
+}
 
-  const typeAnswerForm = document.getElementById("typeAnswerForm");
-  if (typeAnswerForm) typeAnswerForm.addEventListener("submit", handleTypeAnswer);
-
-  const settingsForm = document.getElementById("settingsForm");
-  if (settingsForm) settingsForm.addEventListener("submit", handleSettingsSave);
-
-  const editWordForm = document.getElementById("editWordForm");
-  if (editWordForm) editWordForm.addEventListener("submit", handleEditWordSave);
-
-  const passwordPromptForm = document.getElementById("passwordPromptForm");
-  if (passwordPromptForm) passwordPromptForm.addEventListener("submit", handlePasswordPromptSave);
-
+function bindCurrentView() {
   const typedAnswer = document.getElementById("typedAnswer");
   if (typedAnswer && !typedAnswer.disabled) {
-    typedAnswer.focus();
+    requestAnimationFrame(() => typedAnswer.focus({ preventScroll: true }));
   }
 
   startCountdownClock();
 }
 
-function handleAction(event) {
-  const button = event.currentTarget;
+function requireRole(role) {
+  const valid = hasActiveSession(role);
+  if (!valid) showToast("Phiên đăng nhập đã hết hạn hoặc không hợp lệ.");
+  return valid;
+}
+
+function hasActiveSession(role) {
+  return session?.type === role
+    && hasCloudSession()
+    && Number(session.expiresAt || 0) > Date.now();
+}
+
+function isActionAllowed(action) {
+  if (PUBLIC_ACTIONS.has(action)) return true;
+  if (action === "logout") return ["admin", "user"].includes(session?.type);
+  if (action === "modal-confirm") return ["admin", "user"].includes(session?.type) && hasCloudSession();
+  if (ADMIN_ACTIONS.has(action)) return requireRole("admin");
+  if (USER_ACTIONS.has(action)) return requireRole("user");
+  return false;
+}
+
+function handleAction(button) {
   const action = button.dataset.action;
+
+  if (!isActionAllowed(action)) {
+    showToast("Phiên đăng nhập không có quyền thực hiện thao tác này.");
+    return;
+  }
 
   if (action === "login-admin") navigate({ view: "login", role: "admin" });
   if (action === "login-user") navigate({ view: "login", role: "user" });
   if (action === "back") goBack();
-  if (action === "logout") logout();
+  if (action === "logout") {
+    setButtonBusy(button, "Đang đăng xuất");
+    void logout().then(completed => {
+      if (!completed) restoreButton(button);
+    });
+  }
   if (action === "toggle-theme") toggleTheme();
   if (action === "open-settings") openSettings();
   if (action === "close-modal") closeModal();
@@ -1233,54 +1409,103 @@ function handleAction(event) {
 
 async function handleLogin(event) {
   event.preventDefault();
+  if (isLoginPending) return;
+
   const role = route.role || "user";
-  const username = document.getElementById("username").value.trim();
+  const username = sanitizeUsername(document.getElementById("username").value);
   const password = document.getElementById("loginSecret").value;
 
-  if (role === "admin") {
-    if (username === ADMIN.username && password === ADMIN.password) {
-      await hydrateFromCloudLogin({ role: "admin", username, password });
-      session = { type: "admin" };
-      saveSession();
-      routeStack = [];
-      navigate({ view: "admin" }, false);
-      showToast("Đăng nhập Admin thành công.");
+  if (!isValidUsername(username) || !isValidPassword(password)) {
+    showToast("Tên đăng nhập hoặc mật khẩu không hợp lệ.");
+    return;
+  }
+
+  if (!hasCloudSync()) {
+    showToast(role === "admin"
+      ? "Cần cấu hình Apps Script để đăng nhập Admin an toàn."
+      : "Cần kết nối Apps Script để đăng nhập an toàn.");
+    return;
+  }
+
+  const submitButton = event.submitter || event.target.querySelector('button[type="submit"]');
+  isLoginPending = true;
+  setButtonBusy(submitButton, "Đang đăng nhập");
+
+  try {
+    if (role === "admin") {
+      const cloudLogin = await hydrateFromCloudLogin({ role: "admin", username, password });
+      if (cloudLogin.success && cloudLogin.cloudToken) {
+        session = {
+          type: "admin",
+          username: cloudLogin.username,
+          cloudToken: cloudLogin.cloudToken,
+          expiresAt: cloudLogin.expiresAt
+        };
+        saveSession();
+        persistStateOnly();
+        routeStack = [];
+        navigate({ view: "admin" }, false);
+        showToast("Đăng nhập Admin thành công.");
+        return;
+      }
+
+      showToast("Sai tài khoản hoặc mật khẩu Admin.");
       return;
     }
 
-    showToast("Sai tài khoản hoặc mật khẩu Admin.");
-    return;
-  }
+    const cloudLogin = await hydrateFromCloudLogin({ role: "user", username, password });
+    if (!cloudLogin.success || !cloudLogin.cloudToken) {
+      showToast("User chưa được Admin cấp tài khoản hoặc mật khẩu không đúng.");
+      return;
+    }
 
-  let user = state.users[username];
-  if (!user || user.password !== password) {
-    await hydrateFromCloudLogin({ role: "user", username, password });
-    user = state.users[username];
+    session = {
+      type: "user",
+      username,
+      cloudToken: cloudLogin.cloudToken,
+      expiresAt: cloudLogin.expiresAt
+    };
+    saveSession();
+    persistStateOnly();
+    routeStack = [];
+    navigate({ view: "home" }, false);
+    showToast(`Đã vào workspace của ${username}.`);
+  } finally {
+    isLoginPending = false;
+    restoreButton(submitButton);
   }
-
-  if (!user || user.password !== password) {
-    showToast("User chưa được Admin cấp tài khoản hoặc mật khẩu không đúng.");
-    return;
-  }
-
-  session = { type: "user", username };
-  saveSession();
-  routeStack = [];
-  navigate({ view: "home" }, false);
-  showToast(`Đã vào workspace của ${username}.`);
 }
 
-function handleCreateUser(event) {
+function setButtonBusy(button, label) {
+  if (!button || button.disabled) return;
+  button.dataset.idleHtml = button.innerHTML;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.innerHTML = `<span class="button-spinner" aria-hidden="true"></span>${escapeHtml(label)}`;
+}
+
+function restoreButton(button) {
+  if (!button?.isConnected || !button.dataset.idleHtml) return;
+  button.innerHTML = button.dataset.idleHtml;
+  delete button.dataset.idleHtml;
+  button.disabled = false;
+  button.removeAttribute("aria-busy");
+  createIcons();
+}
+
+async function handleCreateUser(event) {
   event.preventDefault();
-  const username = document.getElementById("newUsername").value.trim();
+  if (!requireRole("admin")) return;
+
+  const username = sanitizeUsername(document.getElementById("newUsername").value);
   const password = document.getElementById("newPassword").value;
 
-  if (!username || !password) {
-    showToast("Vui lòng nhập đủ username và password.");
+  if (!isValidUsername(username) || !isValidPassword(password)) {
+    showToast("Username chỉ gồm chữ, số, dấu chấm, gạch dưới hoặc gạch ngang; mật khẩu dài 4-128 ký tự.");
     return;
   }
 
-  if (username === ADMIN.username) {
+  if (username === session.username) {
     showToast("Username này đang dùng cho Admin.");
     return;
   }
@@ -1290,20 +1515,19 @@ function handleCreateUser(event) {
     return;
   }
 
-  state.users[username] = {
-    username,
-    password,
-    createdAt: Date.now(),
-    settings: { ...DEFAULT_SETTINGS },
-    folders: []
-  };
-  saveState();
-  event.target.reset();
-  showToast("Đã tạo user mới.");
-  render();
+  try {
+    const data = await cloudRequest({ action: "createUser", username, password });
+    replaceAdminState(data.state);
+    event.target.reset();
+    showToast("Đã tạo user mới.");
+    render();
+  } catch (error) {
+    showToast(error.message || "Không thể tạo user.");
+  }
 }
 
 function resetUserPassword(username) {
+  if (!requireRole("admin")) return;
   const user = state.users[username];
   if (!user) return;
 
@@ -1311,6 +1535,7 @@ function resetUserPassword(username) {
 }
 
 function deleteUser(username) {
+  if (!requireRole("admin")) return;
   if (!state.users[username]) return;
 
   openConfirmModal({
@@ -1319,21 +1544,31 @@ function deleteUser(username) {
     confirmText: "Xóa user",
     variant: "danger",
     icon: "trash-2",
-    onConfirm: () => {
-      delete state.users[username];
-      saveState();
-      showToast("Đã xóa user.");
-      render();
+    onConfirm: async () => {
+      try {
+        const data = await cloudRequest({ action: "deleteUser", username });
+        replaceAdminState(data.state);
+        showToast("Đã xóa user.");
+        render();
+      } catch (error) {
+        showToast(error.message || "Không thể xóa user.");
+      }
     }
   });
 }
 
 function handleCreateFolder(event) {
   event.preventDefault();
+  if (!requireRole("user")) return;
   const user = currentUser();
   const input = document.getElementById("folderName");
-  const name = input.value.trim();
+  const name = sanitizeText(input.value, SECURITY_LIMITS.nameLength);
   if (!name) return;
+
+  if (user.folders.length >= SECURITY_LIMITS.foldersPerUser) {
+    showToast("Workspace đã đạt giới hạn folder.");
+    return;
+  }
 
   user.folders.unshift({
     id: uid(),
@@ -1374,11 +1609,17 @@ function deleteFolder(folderId) {
 
 function handleCreateFile(event) {
   event.preventDefault();
+  if (!requireRole("user")) return;
   const user = currentUser();
   const folder = findFolder(user, route.folderId);
   const input = document.getElementById("fileName");
-  const name = input.value.trim();
+  const name = sanitizeText(input.value, SECURITY_LIMITS.nameLength);
   if (!folder || !name) return;
+
+  if (folder.files.length >= SECURITY_LIMITS.filesPerFolder) {
+    showToast("Folder đã đạt giới hạn file.");
+    return;
+  }
 
   folder.files.unshift({
     id: uid(),
@@ -1441,13 +1682,15 @@ function setWordEntryMode(mode) {
     button.classList.toggle("active", button.dataset.mode === nextMode);
   });
 
-  tabs.classList.remove("is-fading");
-  void tabs.offsetWidth;
-  tabs.classList.add("is-fading");
   clearTimeout(tabs.morphTimer);
-  tabs.morphTimer = setTimeout(() => {
-    tabs.classList.remove("is-fading");
-  }, 260);
+  cancelAnimationFrame(tabs.fadeFrame);
+  tabs.classList.remove("is-fading");
+  tabs.fadeFrame = requestAnimationFrame(() => {
+    tabs.classList.add("is-fading");
+    tabs.morphTimer = setTimeout(() => {
+      tabs.classList.remove("is-fading");
+    }, 260);
+  });
 
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     content.classList.remove(previousMode, "manual", "bulk", "entry-swap");
@@ -1493,17 +1736,13 @@ function setWordEntryMode(mode) {
   const direction = targetHeight >= currentHeight ? 1 : -1;
   const runId = uid();
   content.entryMorphId = runId;
-  content.entryAnimations = [];
 
   const finishMorph = () => {
     if (content.entryMorphId !== runId) return;
     clearTimeout(content.entryTimer);
     cancelAnimationFrame(content.entryFrame);
-    clearInterval(content.entryInterval);
     content.entryFrame = null;
-    content.entryInterval = null;
     content.entryMorphId = null;
-    content.entryAnimations = null;
     ghost?.remove();
     content.classList.remove("entry-transitioning");
     content.style.height = "";
@@ -1565,7 +1804,6 @@ function setWordEntryMode(mode) {
     });
   };
 
-  content.entryInterval = setInterval(() => step(performance.now()), 32);
   scheduleFrame();
   content.entryTimer = setTimeout(finishMorph, duration + 140);
 }
@@ -1575,13 +1813,9 @@ function clearWordEntryMorph(content, entryPanel, listPanel) {
 
   clearTimeout(content.entryTimer);
   cancelAnimationFrame(content.entryFrame);
-  clearInterval(content.entryInterval);
   content.entryFrame = null;
-  content.entryInterval = null;
   content.entryMorphId = null;
-  content.entryAnimations?.forEach(animation => animation.cancel());
-  content.entryAnimations = null;
-  document.querySelector(".word-entry-ghost")?.remove();
+  app.querySelector(".word-entry-ghost")?.remove();
 
   content.classList.remove("entry-transitioning");
   content.style.height = "";
@@ -1617,6 +1851,7 @@ function createWordEntryGhost(content, form, currentHeight, previousMode) {
 
 function handleAddWord(event) {
   event.preventDefault();
+  if (!requireRole("user")) return;
   const user = currentUser();
   const folder = findFolder(user, route.folderId);
   const file = folder ? findFile(folder, route.fileId) : null;
@@ -1624,12 +1859,17 @@ function handleAddWord(event) {
 
   let added = 0;
 
-  if (wordEntryMode === "manual") {
-    const term = document.getElementById("wordTerm").value.trim();
-    const meaning = document.getElementById("wordMeaning").value.trim();
-    const example = document.getElementById("wordExample").value.trim();
+  if (file.words.length >= SECURITY_LIMITS.wordsPerFile) {
+    showToast("File đã đạt giới hạn từ vựng.");
+    return;
+  }
 
-    if (!term || !meaning) {
+  if (wordEntryMode === "manual") {
+    const term = sanitizeText(document.getElementById("wordTerm").value, SECURITY_LIMITS.termLength);
+    const meaning = sanitizeText(document.getElementById("wordMeaning").value, SECURITY_LIMITS.meaningLength);
+    const example = sanitizeMultiline(document.getElementById("wordExample").value, SECURITY_LIMITS.exampleLength);
+
+    if (!isValidWordPair(term, meaning)) {
       showToast("Nhập đủ từ tiếng Anh và nghĩa tiếng Việt.");
       return;
     }
@@ -1645,10 +1885,21 @@ function handleAddWord(event) {
       return;
     }
 
-    parseBulkWords(bulk).forEach(item => {
-      file.words.unshift(createWord(item.term, item.meaning, item.example));
-      added += 1;
-    });
+    try {
+      const remaining = SECURITY_LIMITS.wordsPerFile - file.words.length;
+      const parsed = parseBulkWords(bulk);
+      if (parsed.length > remaining) {
+        showToast(`File chỉ còn chỗ cho ${Math.max(0, remaining)} từ.`);
+        return;
+      }
+      parsed.forEach(item => {
+        file.words.unshift(createWord(item.term, item.meaning, item.example));
+        added += 1;
+      });
+    } catch (error) {
+      showToast(error.message || "Dữ liệu nhập hàng loạt không hợp lệ.");
+      return;
+    }
   }
 
   if (added === 0) {
@@ -1665,9 +1916,9 @@ function handleAddWord(event) {
 function createWord(term, meaning, example = "") {
   return {
     id: uid(),
-    term,
-    meaning,
-    example,
+    term: sanitizeText(term, SECURITY_LIMITS.termLength),
+    meaning: sanitizeText(meaning, SECURITY_LIMITS.meaningLength),
+    example: sanitizeMultiline(example, SECURITY_LIMITS.exampleLength),
     level: 0,
     createdAt: Date.now(),
     learnedAt: null,
@@ -1678,33 +1929,43 @@ function createWord(term, meaning, example = "") {
 }
 
 function parseBulkWords(text) {
-  return text
-    .split(/\n+/)
+  const source = String(text || "").replace(/\r\n?/g, "\n");
+  if (source.length > SECURITY_LIMITS.bulkCharacters) {
+    throw new Error("Nội dung nhập hàng loạt quá lớn.");
+  }
+
+  const lines = source.split("\n");
+  if (lines.length > SECURITY_LIMITS.bulkLines) {
+    throw new Error(`Chỉ được nhập tối đa ${SECURITY_LIMITS.bulkLines} dòng mỗi lần.`);
+  }
+
+  return lines
     .map(line => line.trim())
     .filter(Boolean)
     .map(parseBulkLine)
-    .filter(item => item.term && item.meaning);
+    .filter(item => isValidWordPair(item.term, item.meaning));
 }
 
 function parseBulkLine(line) {
-  const separated = line.match(/^(.+?)\s*[:：]\s*(.+)$/)
-    || line.match(/^(.+?)\s+[-–—|,]\s+(.+)$/)
-    || line.match(/^(.+?)\s*[-–—|,]\s*(.+)$/)
-    || line.match(/^(.+?)\s{2,}(.+)$/);
+  const cleanLine = sanitizeText(line, SECURITY_LIMITS.termLength + SECURITY_LIMITS.meaningLength + 16);
+  const separated = cleanLine.match(/^(.+?)\s*[:：]\s*(.+)$/)
+    || cleanLine.match(/^(.+?)\s+[-–—|,]\s+(.+)$/)
+    || cleanLine.match(/^(.+?)\s*[-–—|,]\s*(.+)$/)
+    || cleanLine.match(/^(.+?)\s{2,}(.+)$/);
 
   if (separated) {
     return {
-      term: separated[1].trim(),
-      meaning: separated[2].trim()
+      term: sanitizeText(separated[1], SECURITY_LIMITS.termLength),
+      meaning: sanitizeText(separated[2], SECURITY_LIMITS.meaningLength)
     };
   }
 
-  const words = line.split(/\s+/);
+  const words = cleanLine.split(/\s+/);
   if (words.length < 2) return { term: "", meaning: "" };
 
   return {
-    term: words[0].trim(),
-    meaning: words.slice(1).join(" ").trim()
+    term: sanitizeText(words[0], SECURITY_LIMITS.termLength),
+    meaning: sanitizeText(words.slice(1).join(" "), SECURITY_LIMITS.meaningLength)
   };
 }
 
@@ -1725,17 +1986,18 @@ function openEditWordModal(folderId, fileId, wordId) {
 
 function handleEditWordSave(event) {
   event.preventDefault();
+  if (!requireRole("user")) return;
   if (!modal || modal.type !== "edit-word") return;
 
   const user = currentUser();
   const word = findWord(user, modal.folderId, modal.fileId, modal.wordId);
   if (!word) return;
 
-  const term = document.getElementById("editWordTerm").value.trim();
-  const meaning = document.getElementById("editWordMeaning").value.trim();
-  const example = document.getElementById("editWordExample").value.trim();
+  const term = sanitizeText(document.getElementById("editWordTerm").value, SECURITY_LIMITS.termLength);
+  const meaning = sanitizeText(document.getElementById("editWordMeaning").value, SECURITY_LIMITS.meaningLength);
+  const example = sanitizeMultiline(document.getElementById("editWordExample").value, SECURITY_LIMITS.exampleLength);
 
-  if (!term || !meaning) {
+  if (!isValidWordPair(term, meaning)) {
     showToast("Từ tiếng Anh và định nghĩa không được để trống.");
     return;
   }
@@ -1764,6 +2026,7 @@ function deleteWord(folderId, fileId, wordId) {
 
 function handleReceiveShare(event) {
   event.preventDefault();
+  if (!requireRole("user")) return;
   const input = document.getElementById("shareInput");
   const payload = parseShareLink(input.value.trim());
 
@@ -1792,9 +2055,16 @@ function dismissPendingShare(shouldRender = true) {
 
 function importSharePayload(payload) {
   const user = currentUser();
-  if (!user) return;
+  if (!user || !isValidSharePayload(payload)) {
+    showToast("Link chia sẻ không hợp lệ.");
+    return;
+  }
 
   if (payload.type === "folder") {
+    if (user.folders.length >= SECURITY_LIMITS.foldersPerUser) {
+      showToast("Workspace đã đạt giới hạn folder.");
+      return;
+    }
     const folder = cloneFolderForImport(payload.data, payload.owner);
     user.folders.unshift(folder);
     saveState();
@@ -1824,6 +2094,11 @@ function importSharedFileToFolder(folderId) {
 
   if (!folder) {
     showToast("Không tìm thấy folder đã chọn.");
+    return;
+  }
+
+  if (folder.files.length >= SECURITY_LIMITS.filesPerFolder) {
+    showToast("Folder đã đạt giới hạn file.");
     return;
   }
 
@@ -1947,19 +2222,27 @@ function openPasswordPrompt(username) {
   render();
 }
 
-function handlePasswordPromptSave(event) {
+async function handlePasswordPromptSave(event) {
   event.preventDefault();
-  if (!modal || modal.type !== "password-prompt") return;
+  if (!requireRole("admin") || !modal || modal.type !== "password-prompt") return;
 
   const user = state.users[modal.username];
-  const password = document.getElementById("passwordPromptInput").value.trim();
-  if (!user || !password) return;
+  const username = modal.username;
+  const password = document.getElementById("passwordPromptInput").value;
+  if (!user || !isValidPassword(password)) {
+    showToast("Mật khẩu phải dài từ 4 đến 128 ký tự.");
+    return;
+  }
 
-  user.password = password;
-  saveState();
-  modal = null;
-  showToast("Đã đổi mật khẩu user.");
-  render();
+  try {
+    const data = await cloudRequest({ action: "resetUserPassword", username, password });
+    replaceAdminState(data.state);
+    modal = null;
+    showToast("Đã đổi mật khẩu user.");
+    render();
+  } catch (error) {
+    showToast(error.message || "Không thể đổi mật khẩu.");
+  }
 }
 
 function startStudy(options) {
@@ -2314,43 +2597,64 @@ function getSelectableWords(user, options) {
   return shuffle(words);
 }
 
-function getReviewSchedule(user, filters = {}) {
-  return getAllWords(user, filters)
-    .filter(item => item.word.level > 0 && item.word.nextReviewAt)
-    .sort((a, b) => a.word.nextReviewAt - b.word.nextReviewAt);
-}
-
 function getReviewSummary(user, filters = {}) {
-  const schedule = getReviewSchedule(user, filters);
-  if (schedule.length === 0) return null;
-
   const now = Date.now();
-  const dueNow = schedule.filter(item => item.word.nextReviewAt <= now);
-  if (dueNow.length > 0) {
+  let dueCount = 0;
+  let nextReviewAt = Number.MAX_SAFE_INTEGER;
+  let nextReviewCount = 0;
+
+  forEachWord(user, filters, word => {
+    if (word.level <= 0 || !word.nextReviewAt) return;
+    if (word.nextReviewAt <= now) {
+      dueCount += 1;
+      return;
+    }
+    if (word.nextReviewAt < nextReviewAt) {
+      nextReviewAt = word.nextReviewAt;
+      nextReviewCount = 1;
+    } else if (word.nextReviewAt === nextReviewAt) {
+      nextReviewCount += 1;
+    }
+  });
+
+  if (dueCount > 0) {
     return {
-      count: dueNow.length,
+      count: dueCount,
       nextReviewAt: now,
       overdue: true
     };
   }
 
-  const nextReviewAt = schedule[0].word.nextReviewAt;
-  const count = schedule.filter(item => item.word.nextReviewAt === nextReviewAt).length;
+  if (nextReviewAt === Number.MAX_SAFE_INTEGER) return null;
   return {
-    count,
+    count: nextReviewCount,
     nextReviewAt,
     overdue: false
   };
 }
 
-function getEarliestReviewAt(user, filters = {}) {
-  return getReviewSchedule(user, filters)[0]?.word.nextReviewAt || Number.MAX_SAFE_INTEGER;
+function getEarliestReviewAtForFile(file) {
+  let earliest = Number.MAX_SAFE_INTEGER;
+  (file?.words || []).forEach(word => {
+    if (word.level > 0 && word.nextReviewAt && word.nextReviewAt < earliest) {
+      earliest = word.nextReviewAt;
+    }
+  });
+  return earliest;
+}
+
+function getEarliestReviewAtForFolder(folder) {
+  let earliest = Number.MAX_SAFE_INTEGER;
+  (folder?.files || []).forEach(file => {
+    earliest = Math.min(earliest, getEarliestReviewAtForFile(file));
+  });
+  return earliest;
 }
 
 function sortFoldersForDisplay(user) {
   return [...user.folders].sort((a, b) => {
-    const aTime = getEarliestReviewAt(user, { folderId: a.id });
-    const bTime = getEarliestReviewAt(user, { folderId: b.id });
+    const aTime = getEarliestReviewAtForFolder(a);
+    const bTime = getEarliestReviewAtForFolder(b);
     if (aTime !== bTime) return aTime - bTime;
     return (b.createdAt || 0) - (a.createdAt || 0);
   });
@@ -2358,8 +2662,8 @@ function sortFoldersForDisplay(user) {
 
 function sortFilesForDisplay(user, folder) {
   return [...folder.files].sort((a, b) => {
-    const aTime = getEarliestReviewAt(user, { folderId: folder.id, fileId: a.id });
-    const bTime = getEarliestReviewAt(user, { folderId: folder.id, fileId: b.id });
+    const aTime = getEarliestReviewAtForFile(a);
+    const bTime = getEarliestReviewAtForFile(b);
     if (aTime !== bTime) return aTime - bTime;
     return (b.createdAt || 0) - (a.createdAt || 0);
   });
@@ -2384,19 +2688,27 @@ function buildChoices(word, allWords) {
 }
 
 function getStats(user) {
-  const words = getAllWords(user);
   const counts = Object.fromEntries(LEVELS.map(level => [level.key, 0]));
+  const now = Date.now();
+  let total = 0;
   let learned = 0;
+  let newCount = 0;
+  let dueCount = 0;
 
-  words.forEach(item => {
-    if (item.word.level > 0) learned += 1;
-    const level = LEVELS.find(entry => entry.level === item.word.level);
-    if (level) counts[level.key] += 1;
+  forEachWord(user, {}, word => {
+    total += 1;
+    if (word.level === 0) newCount += 1;
+    if (word.level > 0) learned += 1;
+    if (word.level > 0 && word.nextReviewAt && word.nextReviewAt <= now) dueCount += 1;
+    const levelKey = LEVEL_KEY_BY_NUMBER[word.level];
+    if (levelKey) counts[levelKey] += 1;
   });
 
   return {
-    total: words.length,
+    total,
     learned,
+    new: newCount,
+    due: dueCount,
     mastered: counts.mastered,
     counts
   };
@@ -2404,29 +2716,32 @@ function getStats(user) {
 
 function getAllWords(user, filters = {}) {
   const items = [];
+  forEachWord(user, filters, (word, folder, file) => items.push({ folder, file, word }));
+  return items;
+}
+
+function forEachWord(user, filters = {}, callback) {
+  if (!user || !Array.isArray(user.folders)) return;
   user.folders.forEach(folder => {
     if (filters.folderId && folder.id !== filters.folderId) return;
     folder.files.forEach(file => {
       if (filters.fileId && file.id !== filters.fileId) return;
-      file.words.forEach(word => items.push({ folder, file, word }));
+      file.words.forEach(word => callback(word, folder, file));
     });
   });
-  return items;
 }
 
 function currentUser() {
-  if (!session?.username) return null;
-  const user = state.users[session.username];
-  if (user) ensureUserShape(user);
-  return user || null;
+  if (!hasActiveSession("user") || !session?.username) return null;
+  return state.users[session.username] || null;
 }
 
 function findFolder(user, folderId) {
-  return user.folders.find(folder => folder.id === folderId);
+  return user?.folders?.find(folder => folder.id === folderId) || null;
 }
 
 function findFile(folder, fileId) {
-  return folder.files.find(file => file.id === fileId);
+  return folder?.files?.find(file => file.id === fileId) || null;
 }
 
 function findWord(user, folderId, fileId, wordId) {
@@ -2564,9 +2879,9 @@ function renderFolderCard(user, folder) {
       <h3>${escapeHtml(folder.name)}</h3>
       <p>Tạo ${formatDate(folder.createdAt)}</p>
       <div class="item-card-footer">
-        <button class="btn primary" data-action="open-folder" data-folder-id="${folder.id}"><i data-lucide="folder-open"></i>Mở</button>
-        <button class="btn ghost" data-action="share-folder" data-folder-id="${folder.id}"><i data-lucide="share-2"></i>Share</button>
-        <button class="btn danger" data-action="delete-folder" data-folder-id="${folder.id}"><i data-lucide="trash-2"></i>Xóa</button>
+        <button class="btn primary" data-action="open-folder" data-folder-id="${escapeAttr(folder.id)}"><i data-lucide="folder-open"></i>Mở</button>
+        <button class="btn ghost" data-action="share-folder" data-folder-id="${escapeAttr(folder.id)}"><i data-lucide="share-2"></i>Share</button>
+        <button class="btn danger" data-action="delete-folder" data-folder-id="${escapeAttr(folder.id)}"><i data-lucide="trash-2"></i>Xóa</button>
       </div>
     </article>
   `;
@@ -2584,9 +2899,9 @@ function renderFileCard(user, folder, file) {
       <h3>${escapeHtml(file.name)}</h3>
       <p>${file.words.length ? `Cập nhật lần cuối ${formatDate(file.createdAt)}` : "File trống"}</p>
       <div class="item-card-footer">
-        <button class="btn primary" data-action="open-file" data-folder-id="${folder.id}" data-file-id="${file.id}"><i data-lucide="file-text"></i>Mở</button>
-        <button class="btn ghost" data-action="share-file" data-folder-id="${folder.id}" data-file-id="${file.id}"><i data-lucide="share-2"></i>Share</button>
-        <button class="btn danger" data-action="delete-file" data-folder-id="${folder.id}" data-file-id="${file.id}"><i data-lucide="trash-2"></i>Xóa</button>
+        <button class="btn primary" data-action="open-file" data-folder-id="${escapeAttr(folder.id)}" data-file-id="${escapeAttr(file.id)}"><i data-lucide="file-text"></i>Mở</button>
+        <button class="btn ghost" data-action="share-file" data-folder-id="${escapeAttr(folder.id)}" data-file-id="${escapeAttr(file.id)}"><i data-lucide="share-2"></i>Share</button>
+        <button class="btn danger" data-action="delete-file" data-folder-id="${escapeAttr(folder.id)}" data-file-id="${escapeAttr(file.id)}"><i data-lucide="trash-2"></i>Xóa</button>
       </div>
     </article>
   `;
@@ -2607,10 +2922,10 @@ function renderWordRow(word) {
       </div>
       <div class="row-actions">
         ${word.nextReviewAt ? `<span class="countdown ${overdue ? "overdue" : ""}" data-countdown="${word.nextReviewAt}">${formatCountdown(word.nextReviewAt)}</span>` : ""}
-        <button class="btn ghost" data-action="edit-word" data-folder-id="${route.folderId}" data-file-id="${route.fileId}" data-word-id="${word.id}">
+        <button class="btn ghost" data-action="edit-word" data-folder-id="${escapeAttr(route.folderId)}" data-file-id="${escapeAttr(route.fileId)}" data-word-id="${escapeAttr(word.id)}">
           <i data-lucide="pencil"></i>Sửa
         </button>
-        <button class="btn danger" data-action="delete-word" data-folder-id="${route.folderId}" data-file-id="${route.fileId}" data-word-id="${word.id}">
+        <button class="btn danger" data-action="delete-word" data-folder-id="${escapeAttr(route.folderId)}" data-file-id="${escapeAttr(route.fileId)}" data-word-id="${escapeAttr(word.id)}">
           <i data-lucide="trash-2"></i>Xóa
         </button>
       </div>
@@ -2673,14 +2988,37 @@ function goBack() {
   render();
 }
 
-function logout() {
+async function logout(notifyServer = true) {
+  const logoutAuth = cloudAuthPayload();
+
+  if (notifyServer && session?.type === "user" && hasCloudSession()) {
+    clearTimeout(cloudSyncTimer);
+    try {
+      await saveUserToCloud(currentUser());
+    } catch (error) {
+      showToast("Chưa thể đồng bộ dữ liệu. Vui lòng thử đăng xuất lại khi có mạng.");
+      return false;
+    }
+  }
+
   session = null;
+  state = { users: {} };
   activeStudy = null;
   clearStudyAutoTimer();
   routeStack = [];
   saveSession();
+  localStorage.removeItem(STORE_KEY);
+  sessionStorage.removeItem(ADMIN_STATE_KEY);
   navigate({ view: "landing" }, false);
-  showToast("Đã đăng xuất.");
+  if (notifyServer) showToast("Đã đăng xuất.");
+
+  if (notifyServer && logoutAuth.sessionToken) {
+    void cloudRequest({ action: "logout" }, { auth: logoutAuth }).catch(() => {
+      // The local session is already closed; the server token will expire automatically.
+    });
+  }
+
+  return true;
 }
 
 function applyTheme() {
@@ -2690,9 +3028,22 @@ function applyTheme() {
 
 function toggleTheme() {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-  localStorage.setItem(THEME_KEY, next);
-  applyTheme();
-  render();
+  const applyNextTheme = () => {
+    localStorage.setItem(THEME_KEY, next);
+    document.documentElement.dataset.theme = next;
+  };
+
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !document.startViewTransition) {
+    document.documentElement.classList.add("theme-transitioning");
+    applyNextTheme();
+    clearTimeout(toggleTheme.timer);
+    toggleTheme.timer = setTimeout(() => {
+      document.documentElement.classList.remove("theme-transitioning");
+    }, 380);
+    return;
+  }
+
+  document.startViewTransition(applyNextTheme);
 }
 
 function stripFolderForShare(folder) {
@@ -2714,21 +3065,30 @@ function stripFileForShare(file) {
 }
 
 function cloneFolderForImport(folder, owner) {
+  const cleanOwner = sanitizeText(owner, SECURITY_LIMITS.usernameLength);
+  const files = Array.isArray(folder?.files)
+    ? folder.files.slice(0, SECURITY_LIMITS.filesPerFolder)
+    : [];
   return {
     id: uid(),
-    name: `${folder.name || "Shared folder"}${owner ? ` - ${owner}` : ""}`,
+    name: sanitizeText(`${folder?.name || "Shared folder"}${cleanOwner ? ` - ${cleanOwner}` : ""}`, SECURITY_LIMITS.nameLength),
     createdAt: Date.now(),
-    files: (folder.files || []).map(file => cloneFileForImport(file))
+    files: files.filter(isPlainObject).map(file => cloneFileForImport(file))
   };
 }
 
 function cloneFileForImport(file, owner) {
+  const cleanOwner = sanitizeText(owner, SECURITY_LIMITS.usernameLength);
+  const words = Array.isArray(file?.words)
+    ? file.words.slice(0, SECURITY_LIMITS.wordsPerFile)
+    : [];
   return {
     id: uid(),
-    name: `${file.name || "Shared file"}${owner ? ` - ${owner}` : ""}`,
+    name: sanitizeText(`${file?.name || "Shared file"}${cleanOwner ? ` - ${cleanOwner}` : ""}`, SECURITY_LIMITS.nameLength),
     createdAt: Date.now(),
-    words: (file.words || []).map(word => createWord(word.term || "", word.meaning || "", word.example || ""))
-      .filter(word => word.term && word.meaning)
+    words: words.filter(isPlainObject)
+      .map(word => createWord(word.term || "", word.meaning || "", word.example || ""))
+      .filter(word => isValidWordPair(word.term, word.meaning))
   };
 }
 
@@ -2747,24 +3107,35 @@ function getOrCreateSharedFolder(user) {
 }
 
 function encodePayload(payload) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
 }
 
 function decodePayload(encoded) {
-  return JSON.parse(decodeURIComponent(escape(atob(encoded))));
+  if (typeof encoded !== "string" || encoded.length > SECURITY_LIMITS.shareCharacters) {
+    throw new Error("Share payload is too large");
+  }
+  const binary = atob(encoded);
+  const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
 }
 
 function parseShareLink(value) {
   try {
-    const hashPart = value.includes("#share=")
-      ? value.split("#share=")[1]
-      : value.startsWith("share=")
-        ? value.replace("share=", "")
-        : value;
+    const input = String(value || "").trim();
+    if (!input || input.length > SECURITY_LIMITS.shareCharacters) return null;
+    const hashPart = input.includes("#share=")
+      ? input.split("#share=")[1]
+      : input.startsWith("share=")
+        ? input.replace("share=", "")
+        : input;
 
     const payload = decodePayload(decodeURIComponent(hashPart));
-    if (!payload || !["folder", "file"].includes(payload.type)) return null;
-    return payload;
+    return isValidSharePayload(payload) ? payload : null;
   } catch {
     return null;
   }
@@ -2794,8 +3165,8 @@ function relativeTime(timestamp) {
   return diff <= 0 ? `đến hạn` : `sau ${value} ${label}`;
 }
 
-function formatCountdown(timestamp) {
-  const diff = timestamp - Date.now();
+function formatCountdown(timestamp, now = Date.now()) {
+  const diff = timestamp - now;
   if (diff <= 0) return "Đến hạn ôn";
 
   const totalSeconds = Math.floor(diff / 1000);
@@ -2813,32 +3184,44 @@ function formatCountdown(timestamp) {
 
 function startCountdownClock() {
   if (countdownTimer) {
-    clearInterval(countdownTimer);
+    clearTimeout(countdownTimer);
     countdownTimer = null;
   }
 
-  const countdowns = Array.from(document.querySelectorAll("[data-countdown]"));
+  const countdowns = Array.from(app.querySelectorAll("[data-countdown]"), element => ({
+    element,
+    timestamp: Number(element.dataset.countdown),
+    reviewCount: element.dataset.reviewCount || "",
+    container: element.closest(".review-summary, .word-row")
+  })).filter(item => Number.isFinite(item.timestamp));
   if (countdowns.length === 0) return;
 
   const updateCountdowns = () => {
-    countdowns.forEach(element => {
-      const timestamp = Number(element.dataset.countdown);
-      const overdue = timestamp <= Date.now();
-      if (element.dataset.reviewCount) {
-        const count = element.dataset.reviewCount;
-        element.textContent = overdue
-          ? `Bạn có ${count} từ cần được ôn tập ngay bây giờ`
-          : `Bạn có ${count} từ cần được ôn tập sau ${formatCountdown(timestamp)}`;
-      } else {
-        element.textContent = formatCountdown(timestamp);
-      }
-      element.classList.toggle("overdue", overdue);
-      element.closest(".review-summary, .word-row")?.classList.toggle("overdue", overdue);
+    const now = Date.now();
+
+    if (!document.hidden) {
+      countdowns.forEach(({ element, timestamp, reviewCount, container }) => {
+        const overdue = timestamp <= now;
+        if (reviewCount) {
+          element.textContent = overdue
+            ? `Bạn có ${reviewCount} từ cần được ôn tập ngay bây giờ`
+            : `Bạn có ${reviewCount} từ cần được ôn tập sau ${formatCountdown(timestamp, now)}`;
+        } else {
+          element.textContent = formatCountdown(timestamp, now);
+        }
+        element.classList.toggle("overdue", overdue);
+        container?.classList.toggle("overdue", overdue);
+      });
+    }
+
+    const showSeconds = !document.hidden && countdowns.some(({ timestamp }) => {
+      const remaining = timestamp - now;
+      return remaining > 0 && remaining < 24 * 60 * 60 * 1000;
     });
+    countdownTimer = setTimeout(updateCountdowns, showSeconds ? 1000 : 60 * 1000);
   };
 
   updateCountdowns();
-  countdownTimer = setInterval(updateCountdowns, 1000);
 }
 
 function formatDate(timestamp) {
@@ -2847,6 +3230,92 @@ function formatDate(timestamp) {
     month: "2-digit",
     year: "numeric"
   }).format(new Date(timestamp));
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function sanitizeText(value, maxLength = SECURITY_LIMITS.nameLength) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function sanitizeMultiline(value, maxLength = SECURITY_LIMITS.exampleLength) {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function sanitizeUsername(value) {
+  return sanitizeText(value, SECURITY_LIMITS.usernameLength);
+}
+
+function isValidUsername(value) {
+  const username = sanitizeUsername(value);
+  return USERNAME_PATTERN.test(username)
+    && !["__proto__", "prototype", "constructor"].includes(username.toLowerCase());
+}
+
+function isValidPassword(value) {
+  return typeof value === "string" && value.length >= 4 && value.length <= SECURITY_LIMITS.passwordLength;
+}
+
+function isValidWordPair(term, meaning) {
+  return typeof term === "string"
+    && typeof meaning === "string"
+    && term.length > 0
+    && term.length <= SECURITY_LIMITS.termLength
+    && meaning.length > 0
+    && meaning.length <= SECURITY_LIMITS.meaningLength;
+}
+
+function sanitizeId(value) {
+  const id = String(value || "");
+  return /^[A-Za-z0-9._:-]{1,80}$/.test(id) ? id : uid();
+}
+
+function safeTimestamp(value, fallback) {
+  const timestamp = Number(value);
+  const upperBound = Date.now() + (10 * 365 * 24 * 60 * 60 * 1000);
+  return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= upperBound ? timestamp : fallback;
+}
+
+function nullableTimestamp(value) {
+  if (value === null || value === undefined || value === "") return null;
+  return safeTimestamp(value, null);
+}
+
+function isValidSharePayload(payload) {
+  if (!isPlainObject(payload) || !["folder", "file"].includes(payload.type) || !isPlainObject(payload.data)) {
+    return false;
+  }
+
+  if (payload.owner !== undefined && sanitizeText(payload.owner, SECURITY_LIMITS.usernameLength).length === 0) {
+    return false;
+  }
+
+  const validFile = file => {
+    if (!isPlainObject(file) || !Array.isArray(file.words) || file.words.length > SECURITY_LIMITS.wordsPerFile) return false;
+    if (!sanitizeText(file.name || "Shared file", SECURITY_LIMITS.nameLength)) return false;
+    return file.words.every(word => isPlainObject(word)
+      && isValidWordPair(
+        sanitizeText(word.term, SECURITY_LIMITS.termLength),
+        sanitizeText(word.meaning, SECURITY_LIMITS.meaningLength)
+      ));
+  };
+
+  if (payload.type === "file") return validFile(payload.data);
+  if (!Array.isArray(payload.data.files) || payload.data.files.length > SECURITY_LIMITS.filesPerFolder) return false;
+  return Boolean(sanitizeText(payload.data.name || "Shared folder", SECURITY_LIMITS.nameLength))
+    && payload.data.files.every(validFile);
 }
 
 function normalizeAnswer(value) {
